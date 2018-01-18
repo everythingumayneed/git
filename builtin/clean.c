@@ -8,6 +8,7 @@
 
 #include "builtin.h"
 #include "cache.h"
+#include "config.h"
 #include "dir.h"
 #include "parse-options.h"
 #include "string-list.h"
@@ -32,15 +33,6 @@ static const char *msg_skip_git_dir = N_("Skipping repository %s\n");
 static const char *msg_would_skip_git_dir = N_("Would skip repository %s\n");
 static const char *msg_warn_remove_failed = N_("failed to remove %s");
 
-static int clean_use_color = -1;
-static char clean_colors[][COLOR_MAXLEN] = {
-	GIT_COLOR_RESET,
-	GIT_COLOR_NORMAL,	/* PLAIN */
-	GIT_COLOR_BOLD_BLUE,	/* PROMPT */
-	GIT_COLOR_BOLD,		/* HEADER */
-	GIT_COLOR_BOLD_RED,	/* HELP */
-	GIT_COLOR_BOLD_RED,	/* ERROR */
-};
 enum color_clean {
 	CLEAN_COLOR_RESET = 0,
 	CLEAN_COLOR_PLAIN = 1,
@@ -48,6 +40,16 @@ enum color_clean {
 	CLEAN_COLOR_HEADER = 3,
 	CLEAN_COLOR_HELP = 4,
 	CLEAN_COLOR_ERROR = 5
+};
+
+static int clean_use_color = -1;
+static char clean_colors[][COLOR_MAXLEN] = {
+	[CLEAN_COLOR_ERROR] = GIT_COLOR_BOLD_RED,
+	[CLEAN_COLOR_HEADER] = GIT_COLOR_BOLD,
+	[CLEAN_COLOR_HELP] = GIT_COLOR_BOLD_RED,
+	[CLEAN_COLOR_PLAIN] = GIT_COLOR_NORMAL,
+	[CLEAN_COLOR_PROMPT] = GIT_COLOR_BOLD_BLUE,
+	[CLEAN_COLOR_RESET] = GIT_COLOR_RESET,
 };
 
 #define MENU_OPTS_SINGLETON		01
@@ -166,7 +168,7 @@ static int remove_dirs(struct strbuf *path, const char *prefix, int force_flag,
 		}
 
 		*dir_gone = 0;
-		return 0;
+		goto out;
 	}
 
 	dir = opendir(path->buf);
@@ -180,7 +182,8 @@ static int remove_dirs(struct strbuf *path, const char *prefix, int force_flag,
 			warning_errno(_(msg_warn_remove_failed), quoted.buf);
 			*dir_gone = 0;
 		}
-		return res;
+		ret = res;
+		goto out;
 	}
 
 	strbuf_complete(path, '/');
@@ -248,6 +251,8 @@ static int remove_dirs(struct strbuf *path, const char *prefix, int force_flag,
 		for (i = 0; i < dels.nr; i++)
 			printf(dry_run ?  _(msg_would_remove) : _(msg_remove), dels.items[i].string);
 	}
+out:
+	strbuf_release(&quoted);
 	string_list_clear(&dels, 0);
 	return ret;
 }
@@ -683,7 +688,7 @@ static int filter_by_patterns_cmd(void)
 		for_each_string_list_item(item, &del_list) {
 			int dtype = DT_UNKNOWN;
 
-			if (is_excluded(&dir, item->string, &dtype)) {
+			if (is_excluded(&dir, &the_index, item->string, &dtype)) {
 				*item->string = '\0';
 				changed++;
 			}
@@ -837,8 +842,7 @@ static void interactive_main_loop(void)
 			int ret;
 			ret = menus[*chosen].fn();
 			if (ret != MENU_RETURN_NO_LOOP) {
-				free(chosen);
-				chosen = NULL;
+				FREE_AND_NULL(chosen);
 				if (!del_list.nr) {
 					clean_print_color(CLEAN_COLOR_ERROR);
 					printf_ln(_("No more files to clean, exiting."));
@@ -851,8 +855,7 @@ static void interactive_main_loop(void)
 			quit_cmd();
 		}
 
-		free(chosen);
-		chosen = NULL;
+		FREE_AND_NULL(chosen);
 		break;
 	}
 }
@@ -965,7 +968,7 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 		       PATHSPEC_PREFER_CWD,
 		       prefix, argv);
 
-	fill_directory(&dir, &pathspec);
+	fill_directory(&dir, &the_index, &pathspec);
 	correct_untracked_entries(&dir);
 
 	for (i = 0; i < dir.nr; i++) {

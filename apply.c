@@ -8,6 +8,7 @@
  */
 
 #include "cache.h"
+#include "config.h"
 #include "blob.h"
 #include "delta.h"
 #include "diff.h"
@@ -74,14 +75,10 @@ static int parse_ignorewhitespace_option(struct apply_state *state,
 }
 
 int init_apply_state(struct apply_state *state,
-		     const char *prefix,
-		     struct lock_file *lock_file)
+		     const char *prefix)
 {
 	memset(state, 0, sizeof(*state));
 	state->prefix = prefix;
-	state->prefix_length = state->prefix ? strlen(state->prefix) : 0;
-	state->lock_file = lock_file;
-	state->newfd = -1;
 	state->apply = 1;
 	state->line_termination = '\n';
 	state->p_value = 1;
@@ -146,8 +143,6 @@ int check_apply_state(struct apply_state *state, int force_apply)
 	}
 	if (state->check_index)
 		state->unsafe_paths = 0;
-	if (!state->lock_file)
-		return error("BUG: state->lock_file should not be NULL");
 
 	if (state->apply_verbosity <= verbosity_silent) {
 		state->saved_error_routine = get_error_routine();
@@ -219,6 +214,7 @@ struct patch {
 	unsigned int recount:1;
 	unsigned int conflicted_threeway:1;
 	unsigned int direct_to_threeway:1;
+	unsigned int crlf_in_old:1;
 	struct fragment *fragments;
 	char *result;
 	size_t resultsize;
@@ -304,52 +300,33 @@ static uint32_t hash_line(const char *cp, size_t len)
 static int fuzzy_matchlines(const char *s1, size_t n1,
 			    const char *s2, size_t n2)
 {
-	const char *last1 = s1 + n1 - 1;
-	const char *last2 = s2 + n2 - 1;
-	int result = 0;
+	const char *end1 = s1 + n1;
+	const char *end2 = s2 + n2;
 
 	/* ignore line endings */
-	while ((*last1 == '\r') || (*last1 == '\n'))
-		last1--;
-	while ((*last2 == '\r') || (*last2 == '\n'))
-		last2--;
+	while (s1 < end1 && (end1[-1] == '\r' || end1[-1] == '\n'))
+		end1--;
+	while (s2 < end2 && (end2[-1] == '\r' || end2[-1] == '\n'))
+		end2--;
 
-	/* skip leading whitespaces, if both begin with whitespace */
-	if (s1 <= last1 && s2 <= last2 && isspace(*s1) && isspace(*s2)) {
-		while (isspace(*s1) && (s1 <= last1))
-			s1++;
-		while (isspace(*s2) && (s2 <= last2))
-			s2++;
-	}
-	/* early return if both lines are empty */
-	if ((s1 > last1) && (s2 > last2))
-		return 1;
-	while (!result) {
-		result = *s1++ - *s2++;
-		/*
-		 * Skip whitespace inside. We check for whitespace on
-		 * both buffers because we don't want "a b" to match
-		 * "ab"
-		 */
-		if (isspace(*s1) && isspace(*s2)) {
-			while (isspace(*s1) && s1 <= last1)
+	while (s1 < end1 && s2 < end2) {
+		if (isspace(*s1)) {
+			/*
+			 * Skip whitespace. We check on both buffers
+			 * because we don't want "a b" to match "ab".
+			 */
+			if (!isspace(*s2))
+				return 0;
+			while (s1 < end1 && isspace(*s1))
 				s1++;
-			while (isspace(*s2) && s2 <= last2)
+			while (s2 < end2 && isspace(*s2))
 				s2++;
-		}
-		/*
-		 * If we reached the end on one side only,
-		 * lines don't match
-		 */
-		if (
-		    ((s2 > last2) && (s1 <= last1)) ||
-		    ((s1 > last1) && (s2 <= last2)))
+		} else if (*s1++ != *s2++)
 			return 0;
-		if ((s1 > last1) && (s2 > last2))
-			break;
 	}
 
-	return !result;
+	/* If we reached the end on one side only, lines don't match. */
+	return s1 == end1 && s2 == end2;
 }
 
 static void add_line_info(struct image *img, const char *bol, size_t len, unsigned flag)
@@ -763,17 +740,6 @@ static char *find_name_traditional(struct apply_state *state,
 	return find_name_common(state, line, def, p_value, line + len, 0);
 }
 
-static int count_slashes(const char *cp)
-{
-	int cnt = 0;
-	char ch;
-
-	while ((ch = *cp++))
-		if (ch == '/')
-			cnt++;
-	return cnt;
-}
-
 /*
  * Given the string after "--- " or "+++ ", guess the appropriate
  * p_value for the given patch.
@@ -796,11 +762,11 @@ static int guess_p_value(struct apply_state *state, const char *nameline)
 		 * Does it begin with "a/$our-prefix" and such?  Then this is
 		 * very likely to apply to our directory.
 		 */
-		if (!strncmp(name, state->prefix, state->prefix_length))
+		if (starts_with(name, state->prefix))
 			val = count_slashes(state->prefix);
 		else {
 			cp++;
-			if (!strncmp(cp, state->prefix, state->prefix_length))
+			if (starts_with(cp, state->prefix))
 				val = count_slashes(state->prefix) + 1;
 		}
 	}
@@ -822,16 +788,13 @@ static int has_epoch_timestamp(const char *nameline)
 	 * 1970-01-01, and the seconds part must be "00".
 	 */
 	const char stamp_regexp[] =
-		"^(1969-12-31|1970-01-01)"
-		" "
-		"[0-2][0-9]:[0-5][0-9]:00(\\.0+)?"
+		"^[0-2][0-9]:([0-5][0-9]):00(\\.0+)?"
 		" "
 		"([-+][0-2][0-9]:?[0-5][0-9])\n";
 	const char *timestamp = NULL, *cp, *colon;
 	static regex_t *stamp;
 	regmatch_t m[10];
-	int zoneoffset;
-	int hourminute;
+	int zoneoffset, epoch_hour, hour, minute;
 	int status;
 
 	for (cp = nameline; *cp != '\n'; cp++) {
@@ -840,6 +803,18 @@ static int has_epoch_timestamp(const char *nameline)
 	}
 	if (!timestamp)
 		return 0;
+
+	/*
+	 * YYYY-MM-DD hh:mm:ss must be from either 1969-12-31
+	 * (west of GMT) or 1970-01-01 (east of GMT)
+	 */
+	if (skip_prefix(timestamp, "1969-12-31 ", &timestamp))
+		epoch_hour = 24;
+	else if (skip_prefix(timestamp, "1970-01-01 ", &timestamp))
+		epoch_hour = 0;
+	else
+		return 0;
+
 	if (!stamp) {
 		stamp = xmalloc(sizeof(*stamp));
 		if (regcomp(stamp, stamp_regexp, REG_EXTENDED)) {
@@ -857,6 +832,9 @@ static int has_epoch_timestamp(const char *nameline)
 		return 0;
 	}
 
+	hour = strtol(timestamp, NULL, 10);
+	minute = strtol(timestamp + m[1].rm_so, NULL, 10);
+
 	zoneoffset = strtol(timestamp + m[3].rm_so + 1, (char **) &colon, 10);
 	if (*colon == ':')
 		zoneoffset = zoneoffset * 60 + strtol(colon + 1, NULL, 10);
@@ -865,20 +843,7 @@ static int has_epoch_timestamp(const char *nameline)
 	if (timestamp[m[3].rm_so] == '-')
 		zoneoffset = -zoneoffset;
 
-	/*
-	 * YYYY-MM-DD hh:mm:ss must be from either 1969-12-31
-	 * (west of GMT) or 1970-01-01 (east of GMT)
-	 */
-	if ((zoneoffset < 0 && memcmp(timestamp, "1969-12-31", 10)) ||
-	    (0 <= zoneoffset && memcmp(timestamp, "1970-01-01", 10)))
-		return 0;
-
-	hourminute = (strtol(timestamp + 11, NULL, 10) * 60 +
-		      strtol(timestamp + 14, NULL, 10) -
-		      zoneoffset);
-
-	return ((zoneoffset < 0 && hourminute == 1440) ||
-		(0 <= zoneoffset && !hourminute));
+	return hour * 60 + minute - zoneoffset == epoch_hour * 60;
 }
 
 /*
@@ -972,13 +937,12 @@ static int gitdiff_verify_name(struct apply_state *state,
 	}
 
 	if (*name) {
-		int len = strlen(*name);
 		char *another;
 		if (isnull)
 			return error(_("git apply: bad git-diff - expected /dev/null, got %s on line %d"),
 				     *name, state->linenr);
 		another = find_name(state, line, NULL, state->p_value, TERM_TAB);
-		if (!another || memcmp(another, *name, len + 1)) {
+		if (!another || strcmp(another, *name)) {
 			free(another);
 			return error((side == DIFF_NEW_NAME) ?
 			    _("git apply: bad git-diff - inconsistent new filename on line %d") :
@@ -986,8 +950,7 @@ static int gitdiff_verify_name(struct apply_state *state,
 		}
 		free(another);
 	} else {
-		/* expect "/dev/null" */
-		if (memcmp("/dev/null", line, 9) || line[9] != '\n')
+		if (!starts_with(line, "/dev/null\n"))
 			return error(_("git apply: bad git-diff - expected /dev/null on line %d"), state->linenr);
 	}
 
@@ -1675,6 +1638,19 @@ static void check_whitespace(struct apply_state *state,
 }
 
 /*
+ * Check if the patch has context lines with CRLF or
+ * the patch wants to remove lines with CRLF.
+ */
+static void check_old_for_crlf(struct patch *patch, const char *line, int len)
+{
+	if (len >= 2 && line[len-1] == '\n' && line[len-2] == '\r') {
+		patch->ws_rule |= WS_CR_AT_EOL;
+		patch->crlf_in_old = 1;
+	}
+}
+
+
+/*
  * Parse a unified diff. Note that this really needs to parse each
  * fragment separately, since the only way to know the difference
  * between a "---" that is part of a patch, and a "---" that starts
@@ -1724,11 +1700,14 @@ static int parse_fragment(struct apply_state *state,
 			if (!deleted && !added)
 				leading++;
 			trailing++;
+			check_old_for_crlf(patch, line, len);
 			if (!state->apply_in_reverse &&
 			    state->ws_error_action == correct_ws_error)
 				check_whitespace(state, line, len, patch->ws_rule);
 			break;
 		case '-':
+			if (!state->apply_in_reverse)
+				check_old_for_crlf(patch, line, len);
 			if (state->apply_in_reverse &&
 			    state->ws_error_action != nowarn_ws_error)
 				check_whitespace(state, line, len, patch->ws_rule);
@@ -1737,6 +1716,8 @@ static int parse_fragment(struct apply_state *state,
 			trailing = 0;
 			break;
 		case '+':
+			if (state->apply_in_reverse)
+				check_old_for_crlf(patch, line, len);
 			if (!state->apply_in_reverse &&
 			    state->ws_error_action != nowarn_ws_error)
 				check_whitespace(state, line, len, patch->ws_rule);
@@ -2101,17 +2082,16 @@ static int use_patch(struct apply_state *state, struct patch *p)
 	int i;
 
 	/* Paths outside are not touched regardless of "--include" */
-	if (0 < state->prefix_length) {
-		int pathlen = strlen(pathname);
-		if (pathlen <= state->prefix_length ||
-		    memcmp(state->prefix, pathname, state->prefix_length))
+	if (state->prefix && *state->prefix) {
+		const char *rest;
+		if (!skip_prefix(pathname, state->prefix, &rest) || !*rest)
 			return 0;
 	}
 
 	/* See if it matches any of exclude/include rule */
 	for (i = 0; i < state->limit_by_name.nr; i++) {
 		struct string_list_item *it = &state->limit_by_name.items[i];
-		if (!wildmatch(it->string, pathname, 0, NULL))
+		if (!wildmatch(it->string, pathname, 0))
 			return (it->util != NULL);
 	}
 
@@ -2280,8 +2260,11 @@ static void show_stats(struct apply_state *state, struct patch *patch)
 		add, pluses, del, minuses);
 }
 
-static int read_old_data(struct stat *st, const char *path, struct strbuf *buf)
+static int read_old_data(struct stat *st, struct patch *patch,
+			 const char *path, struct strbuf *buf)
 {
+	enum safe_crlf safe_crlf = patch->crlf_in_old ?
+		SAFE_CRLF_KEEP_CRLF : SAFE_CRLF_RENORMALIZE;
 	switch (st->st_mode & S_IFMT) {
 	case S_IFLNK:
 		if (strbuf_readlink(buf, path, st->st_size) < 0)
@@ -2290,7 +2273,15 @@ static int read_old_data(struct stat *st, const char *path, struct strbuf *buf)
 	case S_IFREG:
 		if (strbuf_read_file(buf, path, st->st_size) != st->st_size)
 			return error(_("unable to open or read %s"), path);
-		convert_to_git(path, buf->buf, buf->len, buf, 0);
+		/*
+		 * "git apply" without "--index/--cached" should never look
+		 * at the index; the target file may not have been added to
+		 * the index yet, and we may not even be in any Git repository.
+		 * Pass NULL to convert_to_git() to stress this; the function
+		 * should never look at the index when explicit crlf option
+		 * is given.
+		 */
+		convert_to_git(NULL, path, buf->buf, buf->len, buf, safe_crlf);
 		return 0;
 	default:
 		return -1;
@@ -2821,13 +2812,10 @@ static void update_image(struct apply_state *state,
 		img->line_allocated = img->line;
 	}
 	if (preimage_limit != postimage->nr)
-		memmove(img->line + applied_pos + postimage->nr,
-			img->line + applied_pos + preimage_limit,
-			(img->nr - (applied_pos + preimage_limit)) *
-			sizeof(*img->line));
-	memcpy(img->line + applied_pos,
-	       postimage->line,
-	       postimage->nr * sizeof(*img->line));
+		MOVE_ARRAY(img->line + applied_pos + postimage->nr,
+			   img->line + applied_pos + preimage_limit,
+			   img->nr - (applied_pos + preimage_limit));
+	COPY_ARRAY(img->line + applied_pos, postimage->line, postimage->nr);
 	if (!state->allow_overlap)
 		for (i = 0; i < postimage->nr; i++)
 			img->line[applied_pos + i].flag |= LINE_PATCHED;
@@ -2908,6 +2896,7 @@ static int apply_one_fragment(struct apply_state *state,
 			if (plen && (ws_rule & WS_BLANK_AT_EOF) &&
 			    ws_blank_line(patch + 1, plen, ws_rule))
 				is_blank_context = 1;
+			/* fallthrough */
 		case '-':
 			memcpy(old, patch + 1, plen);
 			add_line_info(&preimage, old, plen,
@@ -2915,7 +2904,7 @@ static int apply_one_fragment(struct apply_state *state,
 			old += plen;
 			if (first == '-')
 				break;
-		/* Fall-through for ' ' */
+			/* fallthrough */
 		case '+':
 			/* --no-add does not add new lines */
 			if (first == '+' && state->no_add)
@@ -2964,6 +2953,8 @@ static int apply_one_fragment(struct apply_state *state,
 	    newlines.len > 0 && newlines.buf[newlines.len - 1] == '\n') {
 		old--;
 		strbuf_setlen(&newlines, newlines.len - 1);
+		preimage.line_allocated[preimage.nr - 1].len--;
+		postimage.line_allocated[postimage.nr - 1].len--;
 	}
 
 	leading = frag->leading;
@@ -3396,6 +3387,7 @@ static int load_patch_target(struct apply_state *state,
 			     struct strbuf *buf,
 			     const struct cache_entry *ce,
 			     struct stat *st,
+			     struct patch *patch,
 			     const char *name,
 			     unsigned expected_mode)
 {
@@ -3411,7 +3403,7 @@ static int load_patch_target(struct apply_state *state,
 		} else if (has_symlink_leading_path(name, strlen(name))) {
 			return error(_("reading from '%s' beyond a symbolic link"), name);
 		} else {
-			if (read_old_data(st, name, buf))
+			if (read_old_data(st, patch, name, buf))
 				return error(_("failed to read %s"), name);
 		}
 	}
@@ -3444,7 +3436,7 @@ static int load_preimage(struct apply_state *state,
 		/* We have a patched copy in memory; use that. */
 		strbuf_add(&buf, previous->result, previous->resultsize);
 	} else {
-		status = load_patch_target(state, &buf, ce, st,
+		status = load_patch_target(state, &buf, ce, st, patch,
 					   patch->old_name, patch->old_mode);
 		if (status < 0)
 			return status;
@@ -3532,7 +3524,7 @@ static int load_current(struct apply_state *state,
 	if (verify_index_match(ce, &st))
 		return error(_("%s: does not match index"), name);
 
-	status = load_patch_target(state, &buf, ce, &st, name, mode);
+	status = load_patch_target(state, &buf, ce, &st, patch, name, mode);
 	if (status < 0)
 		return status;
 	else if (status)
@@ -3563,7 +3555,7 @@ static int try_threeway(struct apply_state *state,
 	/* Preimage the patch was prepared for */
 	if (patch->is_new)
 		write_sha1_file("", 0, blob_type, pre_oid.hash);
-	else if (get_sha1(patch->old_sha1_prefix, pre_oid.hash) ||
+	else if (get_oid(patch->old_sha1_prefix, &pre_oid) ||
 		 read_blob_object(&buf, &pre_oid, patch->old_mode))
 		return error(_("repository lacks the necessary blob to fall back on 3-way merge."));
 
@@ -3728,8 +3720,7 @@ static int check_preimage(struct apply_state *state,
  is_new:
 	patch->is_new = 1;
 	patch->is_delete = 0;
-	free(patch->old_name);
-	patch->old_name = NULL;
+	FREE_AND_NULL(patch->old_name);
 	return 0;
 }
 
@@ -3764,7 +3755,7 @@ static int check_to_create(struct apply_state *state,
 			return 0;
 
 		return EXISTS_IN_WORKTREE;
-	} else if ((errno != ENOENT) && (errno != ENOTDIR)) {
+	} else if (!is_missing_file_error(errno)) {
 		return error_errno("%s", new_name);
 	}
 	return 0;
@@ -4088,7 +4079,7 @@ static int build_fake_ancestor(struct apply_state *state, struct patch *list)
 			else
 				return error(_("sha1 information is lacking or "
 					       "useless for submodule %s"), name);
-		} else if (!get_sha1_blob(patch->old_sha1_prefix, oid.hash)) {
+		} else if (!get_oid_blob(patch->old_sha1_prefix, &oid)) {
 			; /* ok */
 		} else if (!patch->lines_added && !patch->lines_deleted) {
 			/* mode-only change: update the current */
@@ -4696,13 +4687,13 @@ static int apply_patch(struct apply_state *state,
 		state->apply = 0;
 
 	state->update_index = state->check_index && state->apply;
-	if (state->update_index && state->newfd < 0) {
+	if (state->update_index && !is_lock_file_locked(&state->lock_file)) {
 		if (state->index_file)
-			state->newfd = hold_lock_file_for_update(state->lock_file,
-								 state->index_file,
-								 LOCK_DIE_ON_ERROR);
+			hold_lock_file_for_update(&state->lock_file,
+						  state->index_file,
+						  LOCK_DIE_ON_ERROR);
 		else
-			state->newfd = hold_locked_index(state->lock_file, LOCK_DIE_ON_ERROR);
+			hold_locked_index(&state->lock_file, LOCK_DIE_ON_ERROR);
 	}
 
 	if (state->check_index && read_apply_cache(state) < 0) {
@@ -4898,22 +4889,18 @@ int apply_all_patches(struct apply_state *state,
 	}
 
 	if (state->update_index) {
-		res = write_locked_index(&the_index, state->lock_file, COMMIT_LOCK);
+		res = write_locked_index(&the_index, &state->lock_file, COMMIT_LOCK);
 		if (res) {
 			error(_("Unable to write new index file"));
 			res = -128;
 			goto end;
 		}
-		state->newfd = -1;
 	}
 
 	res = !!errs;
 
 end:
-	if (state->newfd >= 0) {
-		rollback_lock_file(state->lock_file);
-		state->newfd = -1;
-	}
+	rollback_lock_file(&state->lock_file);
 
 	if (state->apply_verbosity <= verbosity_silent) {
 		set_error_routine(state->saved_error_routine);

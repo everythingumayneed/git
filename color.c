@@ -1,4 +1,5 @@
 #include "cache.h"
+#include "config.h"
 #include "color.h"
 
 static int git_use_color_default = GIT_COLOR_AUTO;
@@ -328,8 +329,7 @@ static int check_auto_color(void)
 	if (color_stdout_is_tty < 0)
 		color_stdout_is_tty = isatty(1);
 	if (color_stdout_is_tty || (pager_in_use() && pager_use_color)) {
-		char *term = getenv("TERM");
-		if (term && strcmp(term, "dumb"))
+		if (!is_terminal_dumb())
 			return 1;
 	}
 	return 0;
@@ -337,6 +337,13 @@ static int check_auto_color(void)
 
 int want_color(int var)
 {
+	/*
+	 * NEEDSWORK: This function is sometimes used from multiple threads, and
+	 * we end up using want_auto racily. That "should not matter" since
+	 * we always write the same value, but it's still wrong. This function
+	 * is listed in .tsan-suppressions for the time being.
+	 */
+
 	static int want_auto = -1;
 
 	if (var < 0)

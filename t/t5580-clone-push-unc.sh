@@ -1,14 +1,20 @@
 #!/bin/sh
 
-test_description='various UNC path tests (Windows-only)'
+test_description='various Windows-only path tests'
 . ./test-lib.sh
 
-if ! test_have_prereq MINGW; then
-	skip_all='skipping UNC path tests, requires Windows'
+if test_have_prereq CYGWIN
+then
+	alias winpwd='cygpath -aw .'
+elif test_have_prereq MINGW
+then
+	alias winpwd=pwd
+else
+	skip_all='skipping Windows-only path tests'
 	test_done
 fi
 
-UNCPATH="$(pwd)"
+UNCPATH="$(winpwd)"
 case "$UNCPATH" in
 [A-Z]:*)
 	# Use administrative share e.g. \\localhost\C$\git-sdk-64\usr\src\git
@@ -43,6 +49,12 @@ test_expect_success push '
 	) &&
 	rev="$(git -C clone rev-parse --verify refs/heads/to-push)" &&
 	test "$rev" = "$(git rev-parse --verify refs/heads/to-push)"
+'
+
+test_expect_success MINGW 'remote nick cannot contain backslashes' '
+	BACKSLASHED="$(winpwd | tr / \\\\)" &&
+	git ls-remote "$BACKSLASHED" >out 2>err &&
+	test_i18ngrep ! "unable to access" err
 '
 
 test_done

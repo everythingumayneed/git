@@ -56,12 +56,10 @@ MODERN_GIT=$GIT_BUILD_DIR/bin-wrappers/git
 export MODERN_GIT
 
 perf_results_dir=$TEST_OUTPUT_DIRECTORY/test-results
+test -n "$GIT_PERF_SUBSECTION" && perf_results_dir="$perf_results_dir/$GIT_PERF_SUBSECTION"
 mkdir -p "$perf_results_dir"
 rm -f "$perf_results_dir"/$(basename "$0" .sh).subtests
 
-if test -z "$GIT_PERF_REPEAT_COUNT"; then
-	GIT_PERF_REPEAT_COUNT=3
-fi
 die_if_build_dir_not_repo () {
 	if ! ( cd "$TEST_DIRECTORY/.." &&
 		    git rev-parse --build-dir >/dev/null 2>&1 ); then
@@ -77,6 +75,10 @@ if test -z "$GIT_PERF_LARGE_REPO"; then
 	die_if_build_dir_not_repo '$GIT_PERF_LARGE_REPO'
 	GIT_PERF_LARGE_REPO=$TEST_DIRECTORY/..
 fi
+
+test_perf_do_repo_symlink_config_ () {
+	test_have_prereq SYMLINKS || git config core.symlinks false
+}
 
 test_perf_create_repo_from () {
 	test "$#" = 2 ||
@@ -102,15 +104,29 @@ test_perf_create_repo_from () {
 	) &&
 	(
 		cd "$repo" &&
-		"$MODERN_GIT" init -q && {
-			test_have_prereq SYMLINKS ||
-			git config core.symlinks false
-		} &&
-		mv .git/hooks .git/hooks-disabled 2>/dev/null
+		"$MODERN_GIT" init -q &&
+		test_perf_do_repo_symlink_config_ &&
+		mv .git/hooks .git/hooks-disabled 2>/dev/null &&
+		if test -f .git/index.lock
+		then
+			# We may be copying a repo that can't run "git
+			# status" due to a locked index. Since we have
+			# a copy it's fine to remove the lock.
+			rm .git/index.lock
+		fi
 	) || error "failed to copy repository '$source' to '$repo'"
 }
 
 # call at least one of these to establish an appropriately-sized repository
+test_perf_fresh_repo () {
+	repo="${1:-$TRASH_DIRECTORY}"
+	"$MODERN_GIT" init -q "$repo" &&
+	(
+		cd "$repo" &&
+		test_perf_do_repo_symlink_config_
+	)
+}
+
 test_perf_default_repo () {
 	test_perf_create_repo_from "${1:-$TRASH_DIRECTORY}" "$GIT_PERF_REPO"
 }

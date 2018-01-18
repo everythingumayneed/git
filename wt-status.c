@@ -121,15 +121,13 @@ static void status_printf_more(struct wt_status *s, const char *color,
 
 void wt_status_prepare(struct wt_status *s)
 {
-	struct object_id oid;
-
 	memset(s, 0, sizeof(*s));
 	memcpy(s->color_palette, default_wt_status_colors,
 	       sizeof(default_wt_status_colors));
 	s->show_untracked_files = SHOW_NORMAL_UNTRACKED_FILES;
 	s->use_color = -1;
 	s->relative_paths = 1;
-	s->branch = resolve_refdup("HEAD", 0, oid.hash, NULL);
+	s->branch = resolve_refdup("HEAD", 0, NULL, NULL);
 	s->reference = "HEAD";
 	s->fp = stdout;
 	s->index_file = get_index_file();
@@ -137,6 +135,7 @@ void wt_status_prepare(struct wt_status *s)
 	s->untracked.strdup_strings = 1;
 	s->ignored.strdup_strings = 1;
 	s->show_branch = -1;  /* unspecified */
+	s->show_stash = 0;
 	s->display_comment_prefix = 0;
 }
 
@@ -560,12 +559,12 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	init_revisions(&rev, NULL);
 	setup_revisions(0, NULL, &rev, NULL);
 	rev.diffopt.output_format |= DIFF_FORMAT_CALLBACK;
-	DIFF_OPT_SET(&rev.diffopt, DIRTY_SUBMODULES);
+	rev.diffopt.flags.dirty_submodules = 1;
 	rev.diffopt.ita_invisible_in_index = 1;
 	if (!s->show_untracked_files)
-		DIFF_OPT_SET(&rev.diffopt, IGNORE_UNTRACKED_IN_SUBMODULES);
+		rev.diffopt.flags.ignore_untracked_in_submodules = 1;
 	if (s->ignore_submodule_arg) {
-		DIFF_OPT_SET(&rev.diffopt, OVERRIDE_SUBMODULE_CONFIG);
+		rev.diffopt.flags.override_submodule_config = 1;
 		handle_ignore_submodules_arg(&rev.diffopt, s->ignore_submodule_arg);
 	}
 	rev.diffopt.format_callback = wt_status_collect_changed_cb;
@@ -584,7 +583,7 @@ static void wt_status_collect_changes_index(struct wt_status *s)
 	opt.def = s->is_initial ? EMPTY_TREE_SHA1_HEX : s->reference;
 	setup_revisions(0, NULL, &rev, &opt);
 
-	DIFF_OPT_SET(&rev.diffopt, OVERRIDE_SUBMODULE_CONFIG);
+	rev.diffopt.flags.override_submodule_config = 1;
 	rev.diffopt.ita_invisible_in_index = 1;
 	if (s->ignore_submodule_arg) {
 		handle_ignore_submodules_arg(&rev.diffopt, s->ignore_submodule_arg);
@@ -659,13 +658,18 @@ static void wt_status_collect_untracked(struct wt_status *s)
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
 		dir.flags |=
 			DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
-	if (s->show_ignored_files)
+	if (s->show_ignored_mode) {
 		dir.flags |= DIR_SHOW_IGNORED_TOO;
-	else
+
+		if (s->show_ignored_mode == SHOW_MATCHING_IGNORED)
+			dir.flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+	} else {
 		dir.untracked = the_index.untracked;
+	}
+
 	setup_standard_excludes(&dir);
 
-	fill_directory(&dir, &s->pathspec);
+	fill_directory(&dir, &the_index, &s->pathspec);
 
 	for (i = 0; i < dir.nr; i++) {
 		struct dir_entry *ent = dir.entries[i];
@@ -801,6 +805,27 @@ static void wt_longstatus_print_changed(struct wt_status *s)
 	wt_longstatus_print_trailer(s);
 }
 
+static int stash_count_refs(struct object_id *ooid, struct object_id *noid,
+			    const char *email, timestamp_t timestamp, int tz,
+			    const char *message, void *cb_data)
+{
+	int *c = cb_data;
+	(*c)++;
+	return 0;
+}
+
+static void wt_longstatus_print_stash_summary(struct wt_status *s)
+{
+	int stash_count = 0;
+
+	for_each_reflog_ent("refs/stash", stash_count_refs, &stash_count);
+	if (stash_count > 0)
+		status_printf_ln(s, GIT_COLOR_NORMAL,
+				 Q_("Your stash currently has %d entry",
+				    "Your stash currently has %d entries", stash_count),
+				 stash_count);
+}
+
 static void wt_longstatus_print_submodule_summary(struct wt_status *s, int uncommitted)
 {
 	struct child_process sm_summary = CHILD_PROCESS_INIT;
@@ -912,7 +937,7 @@ size_t wt_status_locate_end(const char *s, size_t len)
 
 void wt_status_add_cut_line(FILE *fp)
 {
-	const char *explanation = _("Do not touch the line above.\nEverything below will be removed.");
+	const char *explanation = _("Do not modify or remove the line above.\nEverything below it will be ignored.");
 	struct strbuf buf = STRBUF_INIT;
 
 	fprintf(fp, "%c %s", comment_line_char, cut_line);
@@ -929,7 +954,7 @@ static void wt_longstatus_print_verbose(struct wt_status *s)
 	const char *c = color(WT_STATUS_HEADER, s);
 
 	init_revisions(&rev, NULL);
-	DIFF_OPT_SET(&rev.diffopt, ALLOW_TEXTCONV);
+	rev.diffopt.flags.allow_textconv = 1;
 	rev.diffopt.ita_invisible_in_index = 1;
 
 	memset(&opt, 0, sizeof(opt));
@@ -1003,7 +1028,8 @@ static void wt_longstatus_print_tracking(struct wt_status *s)
 		color_fprintf_ln(s->fp, color(WT_STATUS_HEADER, s), "%c",
 				 comment_line_char);
 	else
-		fputs("", s->fp);
+		fputs("\n", s->fp);
+	strbuf_release(&sb);
 }
 
 static int has_unmerged(struct wt_status *s)
@@ -1066,7 +1092,8 @@ static void show_am_in_progress(struct wt_status *s,
 static char *read_line_from_git_path(const char *filename)
 {
 	struct strbuf buf = STRBUF_INIT;
-	FILE *fp = fopen(git_path("%s", filename), "r");
+	FILE *fp = fopen_or_warn(git_path("%s", filename), "r");
+
 	if (!fp) {
 		strbuf_release(&buf);
 		return NULL;
@@ -1170,6 +1197,7 @@ static int read_rebase_todolist(const char *fname, struct string_list *lines)
 		string_list_append(lines, line.buf);
 	}
 	fclose(f);
+	strbuf_release(&line);
 	return 0;
 }
 
@@ -1389,7 +1417,7 @@ struct grab_1st_switch_cbdata {
 };
 
 static int grab_1st_switch(struct object_id *ooid, struct object_id *noid,
-			   const char *email, unsigned long timestamp, int tz,
+			   const char *email, timestamp_t timestamp, int tz,
 			   const char *message, void *cb_data)
 {
 	struct grab_1st_switch_cbdata *cb = cb_data;
@@ -1426,11 +1454,11 @@ static void wt_status_get_detached_from(struct wt_status_state *state)
 		return;
 	}
 
-	if (dwim_ref(cb.buf.buf, cb.buf.len, oid.hash, &ref) == 1 &&
+	if (dwim_ref(cb.buf.buf, cb.buf.len, &oid, &ref) == 1 &&
 	    /* sha1 is a commit? match without further lookup */
 	    (!oidcmp(&cb.noid, &oid) ||
 	     /* perhaps sha1 is a tag, try to dereference to a commit */
-	     ((commit = lookup_commit_reference_gently(oid.hash, 1)) != NULL &&
+	     ((commit = lookup_commit_reference_gently(&oid, 1)) != NULL &&
 	      !oidcmp(&cb.noid, &commit->object.oid)))) {
 		const char *from = ref;
 		if (!skip_prefix(from, "refs/tags/", &from))
@@ -1578,7 +1606,10 @@ static void wt_longstatus_print(struct wt_status *s)
 
 	if (s->is_initial) {
 		status_printf_ln(s, color(WT_STATUS_HEADER, s), "%s", "");
-		status_printf_ln(s, color(WT_STATUS_HEADER, s), _("Initial commit"));
+		status_printf_ln(s, color(WT_STATUS_HEADER, s),
+				 s->commit_template
+				 ? _("Initial commit")
+				 : _("No commits yet"));
 		status_printf_ln(s, color(WT_STATUS_HEADER, s), "%s", "");
 	}
 
@@ -1593,7 +1624,7 @@ static void wt_longstatus_print(struct wt_status *s)
 	}
 	if (s->show_untracked_files) {
 		wt_longstatus_print_other(s, &s->untracked, _("Untracked files"), "add");
-		if (s->show_ignored_files)
+		if (s->show_ignored_mode)
 			wt_longstatus_print_other(s, &s->ignored, _("Ignored files"), "add -f");
 		if (advice_status_u_option && 2000 < s->untracked_in_ms) {
 			status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "");
@@ -1641,6 +1672,8 @@ static void wt_longstatus_print(struct wt_status *s)
 		} else
 			printf(_("nothing to commit, working tree clean\n"));
 	}
+	if(s->show_stash)
+		wt_longstatus_print_stash_summary(s);
 }
 
 static void wt_shortstatus_unmerged(struct string_list_item *it,
@@ -1735,6 +1768,7 @@ static void wt_shortstatus_print_tracking(struct wt_status *s)
 	const char *branch_color_remote = color(WT_STATUS_REMOTE_BRANCH, s);
 
 	const char *base;
+	char *short_base;
 	const char *branch_name;
 	int num_ours, num_theirs;
 	int upstream_is_gone = 0;
@@ -1748,7 +1782,7 @@ static void wt_shortstatus_print_tracking(struct wt_status *s)
 #define LABEL(string) (s->no_gettext ? (string) : _(string))
 
 	if (s->is_initial)
-		color_fprintf(s->fp, header_color, LABEL(N_("Initial commit on ")));
+		color_fprintf(s->fp, header_color, LABEL(N_("No commits yet on ")));
 
 	if (!strcmp(s->branch, "HEAD")) {
 		color_fprintf(s->fp, color(WT_STATUS_NOBRANCH, s), "%s",
@@ -1769,10 +1803,10 @@ static void wt_shortstatus_print_tracking(struct wt_status *s)
 		upstream_is_gone = 1;
 	}
 
-	base = shorten_unambiguous_ref(base, 0);
+	short_base = shorten_unambiguous_ref(base, 0);
 	color_fprintf(s->fp, header_color, "...");
-	color_fprintf(s->fp, branch_color_remote, "%s", base);
-	free((char *)base);
+	color_fprintf(s->fp, branch_color_remote, "%s", short_base);
+	free(short_base);
 
 	if (!upstream_is_gone && !num_ours && !num_theirs)
 		goto conclude;
@@ -2233,9 +2267,11 @@ int has_unstaged_changes(int ignore_submodules)
 	int result;
 
 	init_revisions(&rev_info, NULL);
-	if (ignore_submodules)
-		DIFF_OPT_SET(&rev_info.diffopt, IGNORE_SUBMODULES);
-	DIFF_OPT_SET(&rev_info.diffopt, QUICK);
+	if (ignore_submodules) {
+		rev_info.diffopt.flags.ignore_submodules = 1;
+		rev_info.diffopt.flags.override_submodule_config = 1;
+	}
+	rev_info.diffopt.flags.quick = 1;
 	diff_setup_done(&rev_info.diffopt);
 	result = run_diff_files(&rev_info, 0);
 	return diff_result_code(&rev_info.diffopt, result);
@@ -2254,8 +2290,8 @@ int has_uncommitted_changes(int ignore_submodules)
 
 	init_revisions(&rev_info, NULL);
 	if (ignore_submodules)
-		DIFF_OPT_SET(&rev_info.diffopt, IGNORE_SUBMODULES);
-	DIFF_OPT_SET(&rev_info.diffopt, QUICK);
+		rev_info.diffopt.flags.ignore_submodules = 1;
+	rev_info.diffopt.flags.quick = 1;
 	add_head_to_pending(&rev_info);
 	diff_setup_done(&rev_info.diffopt);
 	result = run_diff_index(&rev_info, 1);
@@ -2268,14 +2304,14 @@ int has_uncommitted_changes(int ignore_submodules)
  */
 int require_clean_work_tree(const char *action, const char *hint, int ignore_submodules, int gently)
 {
-	struct lock_file *lock_file = xcalloc(1, sizeof(*lock_file));
+	struct lock_file lock_file = LOCK_INIT;
 	int err = 0, fd;
 
-	fd = hold_locked_index(lock_file, 0);
+	fd = hold_locked_index(&lock_file, 0);
 	refresh_cache(REFRESH_QUIET);
 	if (0 <= fd)
-		update_index_if_able(&the_index, lock_file);
-	rollback_lock_file(lock_file);
+		update_index_if_able(&the_index, &lock_file);
+	rollback_lock_file(&lock_file);
 
 	if (has_unstaged_changes(ignore_submodules)) {
 		/* TRANSLATORS: the action is e.g. "pull with rebase" */

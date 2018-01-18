@@ -1,4 +1,5 @@
 #include "builtin.h"
+#include "config.h"
 #include "lockfile.h"
 #include "pack.h"
 #include "refs.h"
@@ -22,6 +23,8 @@
 #include "fsck.h"
 #include "tmp-objdir.h"
 #include "oidset.h"
+#include "packfile.h"
+#include "protocol.h"
 
 static const char * const receive_pack_usage[] = {
 	N_("git receive-pack <git-dir>"),
@@ -78,7 +81,7 @@ static const char *NONCE_OK = "OK";
 static const char *NONCE_SLOP = "SLOP";
 static const char *nonce_status;
 static long nonce_stamp_slop;
-static unsigned long nonce_stamp_slop_limit;
+static timestamp_t nonce_stamp_slop_limit;
 static struct ref_transaction *transaction;
 
 static enum {
@@ -454,17 +457,17 @@ static void hmac_sha1(unsigned char *out,
 	git_SHA1_Final(out, &ctx);
 }
 
-static char *prepare_push_cert_nonce(const char *path, unsigned long stamp)
+static char *prepare_push_cert_nonce(const char *path, timestamp_t stamp)
 {
 	struct strbuf buf = STRBUF_INIT;
 	unsigned char sha1[20];
 
-	strbuf_addf(&buf, "%s:%lu", path, stamp);
+	strbuf_addf(&buf, "%s:%"PRItime, path, stamp);
 	hmac_sha1(sha1, buf.buf, buf.len, cert_nonce_seed, strlen(cert_nonce_seed));;
 	strbuf_release(&buf);
 
 	/* RFC 2104 5. HMAC-SHA1-80 */
-	strbuf_addf(&buf, "%lu-%.*s", stamp, 20, sha1_to_hex(sha1));
+	strbuf_addf(&buf, "%"PRItime"-%.*s", stamp, 20, sha1_to_hex(sha1));
 	return strbuf_detach(&buf, NULL);
 }
 
@@ -499,7 +502,7 @@ static char *find_header(const char *msg, size_t len, const char *key,
 static const char *check_nonce(const char *buf, size_t len)
 {
 	char *nonce = find_header(buf, len, "nonce", NULL);
-	unsigned long stamp, ostamp;
+	timestamp_t stamp, ostamp;
 	char *bohmac, *expect = NULL;
 	const char *retval = NONCE_BAD;
 
@@ -537,7 +540,7 @@ static const char *check_nonce(const char *buf, size_t len)
 		retval = NONCE_BAD;
 		goto leave;
 	}
-	stamp = strtoul(nonce, &bohmac, 10);
+	stamp = parse_timestamp(nonce, &bohmac, 10);
 	if (bohmac == nonce || bohmac[0] != '-') {
 		retval = NONCE_BAD;
 		goto leave;
@@ -555,7 +558,7 @@ static const char *check_nonce(const char *buf, size_t len)
 	 * would mean it was issued by another server with its clock
 	 * skewed in the future.
 	 */
-	ostamp = strtoul(push_cert_nonce, NULL, 10);
+	ostamp = parse_timestamp(push_cert_nonce, NULL, 10);
 	nonce_stamp_slop = (long)ostamp - (long)stamp;
 
 	if (nonce_stamp_slop_limit &&
@@ -741,7 +744,7 @@ static int run_and_feed_hook(const char *hook_name, feed_fn feed,
 		size_t n;
 		if (feed(feed_state, &buf, &n))
 			break;
-		if (write_in_full(proc.in, buf, n) != n)
+		if (write_in_full(proc.in, buf, n) < 0)
 			break;
 	}
 	close(proc.in);
@@ -868,7 +871,7 @@ static void refuse_unconfigured_deny_delete_current(void)
 	rp_error("%s", _(refuse_unconfigured_deny_delete_current_msg));
 }
 
-static int command_singleton_iterator(void *cb_data, unsigned char sha1[20]);
+static int command_singleton_iterator(void *cb_data, struct object_id *oid);
 static int update_shallow_ref(struct command *cmd, struct shallow_info *si)
 {
 	static struct lock_file shallow_lock;
@@ -900,7 +903,7 @@ static int update_shallow_ref(struct command *cmd, struct shallow_info *si)
 	 * not lose these new roots..
 	 */
 	for (i = 0; i < extra.nr; i++)
-		register_shallow(extra.oid[i].hash);
+		register_shallow(&extra.oid[i]);
 
 	si->shallow_ref[cmd->index] = 0;
 	oid_array_clear(&extra);
@@ -918,9 +921,9 @@ static int update_shallow_ref(struct command *cmd, struct shallow_info *si)
  */
 static int head_has_history(void)
 {
-	unsigned char sha1[20];
+	struct object_id oid;
 
-	return !get_sha1("HEAD", sha1);
+	return !get_oid("HEAD", &oid);
 }
 
 static const char *push_to_deploy(unsigned char *sha1,
@@ -1102,8 +1105,8 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 		struct object *old_object, *new_object;
 		struct commit *old_commit, *new_commit;
 
-		old_object = parse_object(old_oid->hash);
-		new_object = parse_object(new_oid->hash);
+		old_object = parse_object(old_oid);
+		new_object = parse_object(new_oid);
 
 		if (!old_object || !new_object ||
 		    old_object->type != OBJ_COMMIT ||
@@ -1126,7 +1129,7 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 
 	if (is_null_oid(new_oid)) {
 		struct strbuf err = STRBUF_INIT;
-		if (!parse_object(old_oid->hash)) {
+		if (!parse_object(old_oid)) {
 			old_oid = NULL;
 			if (ref_exists(name)) {
 				rp_warning("Allowing deletion of corrupt ref.");
@@ -1137,7 +1140,7 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 		}
 		if (ref_transaction_delete(transaction,
 					   namespaced_name,
-					   old_oid->hash,
+					   old_oid,
 					   0, "push", &err)) {
 			rp_error("%s", err.buf);
 			strbuf_release(&err);
@@ -1154,7 +1157,7 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 
 		if (ref_transaction_update(transaction,
 					   namespaced_name,
-					   new_oid->hash, old_oid->hash,
+					   new_oid, old_oid,
 					   0, "push",
 					   &err)) {
 			rp_error("%s", err.buf);
@@ -1205,11 +1208,10 @@ static void check_aliased_update(struct command *cmd, struct string_list *list)
 	const char *dst_name;
 	struct string_list_item *item;
 	struct command *dst_cmd;
-	unsigned char sha1[GIT_MAX_RAWSZ];
 	int flag;
 
 	strbuf_addf(&buf, "%s%s", get_git_namespace(), cmd->ref_name);
-	dst_name = resolve_ref_unsafe(buf.buf, 0, sha1, &flag);
+	dst_name = resolve_ref_unsafe(buf.buf, 0, NULL, &flag);
 	strbuf_release(&buf);
 
 	if (!(flag & REF_ISSYMREF))
@@ -1269,7 +1271,7 @@ static void check_aliased_updates(struct command *commands)
 	string_list_clear(&ref_list, 0);
 }
 
-static int command_singleton_iterator(void *cb_data, unsigned char sha1[20])
+static int command_singleton_iterator(void *cb_data, struct object_id *oid)
 {
 	struct command **cmd_list = cb_data;
 	struct command *cmd = *cmd_list;
@@ -1277,7 +1279,7 @@ static int command_singleton_iterator(void *cb_data, unsigned char sha1[20])
 	if (!cmd || is_null_oid(&cmd->new_oid))
 		return -1; /* end of list */
 	*cmd_list = NULL; /* this returns only one */
-	hashcpy(sha1, cmd->new_oid.hash);
+	oidcpy(oid, &cmd->new_oid);
 	return 0;
 }
 
@@ -1308,7 +1310,7 @@ struct iterate_data {
 	struct shallow_info *si;
 };
 
-static int iterate_receive_command_list(void *cb_data, unsigned char sha1[20])
+static int iterate_receive_command_list(void *cb_data, struct object_id *oid)
 {
 	struct iterate_data *data = cb_data;
 	struct command **cmd_list = &data->cmds;
@@ -1319,7 +1321,7 @@ static int iterate_receive_command_list(void *cb_data, unsigned char sha1[20])
 			/* to be checked in update_shallow_ref() */
 			continue;
 		if (!is_null_oid(&cmd->new_oid) && !cmd->skip_update) {
-			hashcpy(sha1, cmd->new_oid.hash);
+			oidcpy(oid, &cmd->new_oid);
 			*cmd_list = cmd->next;
 			return 0;
 		}
@@ -1457,7 +1459,6 @@ static void execute_commands(struct command *commands,
 {
 	struct check_connected_options opt = CHECK_CONNECTED_INIT;
 	struct command *cmd;
-	struct object_id oid;
 	struct iterate_data data;
 	struct async muxer;
 	int err_fd = 0;
@@ -1514,7 +1515,7 @@ static void execute_commands(struct command *commands,
 	check_aliased_updates(commands);
 
 	free(head_name_to_free);
-	head_name = head_name_to_free = resolve_refdup("HEAD", 0, oid.hash, NULL);
+	head_name = head_name_to_free = resolve_refdup("HEAD", 0, NULL, NULL);
 
 	if (use_atomic)
 		execute_commands_atomic(commands, si);
@@ -1805,7 +1806,7 @@ static const char *unpack_with_sideband(struct shallow_info *si)
 static void prepare_shallow_update(struct command *commands,
 				   struct shallow_info *si)
 {
-	int i, j, k, bitmap_size = (si->ref->nr + 31) / 32;
+	int i, j, k, bitmap_size = DIV_ROUND_UP(si->ref->nr, 32);
 
 	ALLOC_ARRAY(si->used_shallow, si->shallow->nr);
 	assign_shallow_commits_to_refs(si, si->used_shallow, NULL);
@@ -1960,6 +1961,22 @@ int cmd_receive_pack(int argc, const char **argv, const char *prefix)
 		unpack_limit = transfer_unpack_limit;
 	else if (0 <= receive_unpack_limit)
 		unpack_limit = receive_unpack_limit;
+
+	switch (determine_protocol_version_server()) {
+	case protocol_v1:
+		/*
+		 * v1 is just the original protocol with a version string,
+		 * so just fall through after writing the version string.
+		 */
+		if (advertise_refs || !stateless_rpc)
+			packet_write_fmt(1, "version 1\n");
+
+		/* fallthrough */
+	case protocol_v0:
+		break;
+	case protocol_unknown_version:
+		BUG("unknown protocol version");
+	}
 
 	if (advertise_refs || !stateless_rpc) {
 		write_head_info();

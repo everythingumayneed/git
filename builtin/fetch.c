@@ -2,6 +2,8 @@
  * "git fetch"
  */
 #include "cache.h"
+#include "config.h"
+#include "repository.h"
 #include "refs.h"
 #include "commit.h"
 #include "builtin.h"
@@ -16,6 +18,7 @@
 #include "connected.h"
 #include "argv-array.h"
 #include "utf8.h"
+#include "packfile.h"
 
 static const char * const builtin_fetch_usage[] = {
 	N_("git fetch [<options>] [<repository> [<refspec>...]]"),
@@ -36,9 +39,9 @@ static int prune = -1; /* unspecified */
 #define PRUNE_BY_DEFAULT 0 /* do we prune by default? */
 
 static int all, append, dry_run, force, keep, multiple, update_head_ok, verbosity, deepen_relative;
-static int progress = -1, recurse_submodules = RECURSE_SUBMODULES_DEFAULT;
+static int progress = -1;
 static int tags = TAGS_DEFAULT, unshallow, update_shallow, deepen;
-static int max_children = -1;
+static int max_children = 1;
 static enum transport_family family;
 static const char *depth;
 static const char *deepen_since;
@@ -48,24 +51,11 @@ static struct strbuf default_rla = STRBUF_INIT;
 static struct transport *gtransport;
 static struct transport *gsecondary;
 static const char *submodule_prefix = "";
-static const char *recurse_submodules_default;
+static int recurse_submodules = RECURSE_SUBMODULES_DEFAULT;
+static int recurse_submodules_default = RECURSE_SUBMODULES_ON_DEMAND;
 static int shown_url = 0;
 static int refmap_alloc, refmap_nr;
 static const char **refmap_array;
-
-static int option_parse_recurse_submodules(const struct option *opt,
-				   const char *arg, int unset)
-{
-	if (unset) {
-		recurse_submodules = RECURSE_SUBMODULES_OFF;
-	} else {
-		if (arg)
-			recurse_submodules = parse_fetch_recurse_submodules_arg(opt->long_name, arg);
-		else
-			recurse_submodules = RECURSE_SUBMODULES_ON;
-	}
-	return 0;
-}
 
 static int git_fetch_config(const char *k, const char *v, void *cb)
 {
@@ -73,7 +63,35 @@ static int git_fetch_config(const char *k, const char *v, void *cb)
 		fetch_prune_config = git_config_bool(k, v);
 		return 0;
 	}
+
+	if (!strcmp(k, "submodule.recurse")) {
+		int r = git_config_bool(k, v) ?
+			RECURSE_SUBMODULES_ON : RECURSE_SUBMODULES_OFF;
+		recurse_submodules = r;
+	}
+
+	if (!strcmp(k, "submodule.fetchjobs")) {
+		max_children = parse_submodule_fetchjobs(k, v);
+		return 0;
+	} else if (!strcmp(k, "fetch.recursesubmodules")) {
+		recurse_submodules = parse_fetch_recurse_submodules_arg(k, v);
+		return 0;
+	}
+
 	return git_default_config(k, v, cb);
+}
+
+static int gitmodules_fetch_config(const char *var, const char *value, void *cb)
+{
+	if (!strcmp(var, "submodule.fetchjobs")) {
+		max_children = parse_submodule_fetchjobs(var, value);
+		return 0;
+	} else if (!strcmp(var, "fetch.recursesubmodules")) {
+		recurse_submodules = parse_fetch_recurse_submodules_arg(var, value);
+		return 0;
+	}
+
+	return 0;
 }
 
 static int parse_refmap_arg(const struct option *opt, const char *arg, int unset)
@@ -108,9 +126,9 @@ static struct option builtin_fetch_options[] = {
 		    N_("number of submodules fetched in parallel")),
 	OPT_BOOL('p', "prune", &prune,
 		 N_("prune remote-tracking branches no longer on remote")),
-	{ OPTION_CALLBACK, 0, "recurse-submodules", NULL, N_("on-demand"),
+	{ OPTION_CALLBACK, 0, "recurse-submodules", &recurse_submodules, N_("on-demand"),
 		    N_("control recursive fetching of submodules"),
-		    PARSE_OPT_OPTARG, option_parse_recurse_submodules },
+		    PARSE_OPT_OPTARG, option_fetch_parse_recurse_submodules },
 	OPT_BOOL(0, "dry-run", &dry_run,
 		 N_("dry run")),
 	OPT_BOOL('k', "keep", &keep, N_("keep downloaded pack")),
@@ -130,9 +148,11 @@ static struct option builtin_fetch_options[] = {
 		   PARSE_OPT_NONEG | PARSE_OPT_NOARG, NULL, 1 },
 	{ OPTION_STRING, 0, "submodule-prefix", &submodule_prefix, N_("dir"),
 		   N_("prepend this to submodule path output"), PARSE_OPT_HIDDEN },
-	{ OPTION_STRING, 0, "recurse-submodules-default",
-		   &recurse_submodules_default, NULL,
-		   N_("default mode for recursion"), PARSE_OPT_HIDDEN },
+	{ OPTION_CALLBACK, 0, "recurse-submodules-default",
+		   &recurse_submodules_default, N_("on-demand"),
+		   N_("default for recursive fetching of submodules "
+		      "(lower priority than config files)"),
+		   PARSE_OPT_HIDDEN, option_fetch_parse_recurse_submodules },
 	OPT_BOOL(0, "update-shallow", &update_shallow,
 		 N_("accept refs that update .git/shallow")),
 	{ OPTION_CALLBACK, 0, "refmap", NULL, N_("refmap"),
@@ -242,9 +262,11 @@ static void find_non_local_tags(struct transport *transport,
 		 */
 		if (ends_with(ref->name, "^{}")) {
 			if (item &&
-			    !has_object_file_with_flags(&ref->old_oid, HAS_SHA1_QUICK) &&
+			    !has_object_file_with_flags(&ref->old_oid,
+							OBJECT_INFO_QUICK) &&
 			    !will_fetch(head, ref->old_oid.hash) &&
-			    !has_sha1_file_with_flags(item->util, HAS_SHA1_QUICK) &&
+			    !has_sha1_file_with_flags(item->util,
+						      OBJECT_INFO_QUICK) &&
 			    !will_fetch(head, item->util))
 				item->util = NULL;
 			item = NULL;
@@ -258,7 +280,7 @@ static void find_non_local_tags(struct transport *transport,
 		 * fetch.
 		 */
 		if (item &&
-		    !has_sha1_file_with_flags(item->util, HAS_SHA1_QUICK) &&
+		    !has_sha1_file_with_flags(item->util, OBJECT_INFO_QUICK) &&
 		    !will_fetch(head, item->util))
 			item->util = NULL;
 
@@ -279,7 +301,7 @@ static void find_non_local_tags(struct transport *transport,
 	 * checked to see if it needs fetching.
 	 */
 	if (item &&
-	    !has_sha1_file_with_flags(item->util, HAS_SHA1_QUICK) &&
+	    !has_sha1_file_with_flags(item->util, OBJECT_INFO_QUICK) &&
 	    !will_fetch(head, item->util))
 		item->util = NULL;
 
@@ -436,8 +458,8 @@ static int s_update_ref(const char *action,
 	transaction = ref_transaction_begin(&err);
 	if (!transaction ||
 	    ref_transaction_update(transaction, ref->name,
-				   ref->new_oid.hash,
-				   check_old ? ref->old_oid.hash : NULL,
+				   &ref->new_oid,
+				   check_old ? &ref->old_oid : NULL,
 				   0, msg, &err))
 		goto fail;
 
@@ -636,8 +658,8 @@ static int update_local_ref(struct ref *ref,
 		return r;
 	}
 
-	current = lookup_commit_reference_gently(ref->old_oid.hash, 1);
-	updated = lookup_commit_reference_gently(ref->new_oid.hash, 1);
+	current = lookup_commit_reference_gently(&ref->old_oid, 1);
+	updated = lookup_commit_reference_gently(&ref->new_oid, 1);
 	if (!current || !updated) {
 		const char *msg;
 		const char *what;
@@ -706,7 +728,7 @@ static int update_local_ref(struct ref *ref,
 	}
 }
 
-static int iterate_ref_map(void *cb_data, unsigned char sha1[20])
+static int iterate_ref_map(void *cb_data, struct object_id *oid)
 {
 	struct ref **rm = cb_data;
 	struct ref *ref = *rm;
@@ -716,7 +738,7 @@ static int iterate_ref_map(void *cb_data, unsigned char sha1[20])
 	if (!ref)
 		return -1; /* end of the list */
 	*rm = ref->next;
-	hashcpy(sha1, ref->old_oid.hash);
+	oidcpy(oid, &ref->old_oid);
 	return 0;
 }
 
@@ -770,7 +792,8 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 				continue;
 			}
 
-			commit = lookup_commit_reference_gently(rm->old_oid.hash, 1);
+			commit = lookup_commit_reference_gently(&rm->old_oid,
+								1);
 			if (!commit)
 				rm->fetch_head_status = FETCH_HEAD_NOT_FOR_MERGE;
 
@@ -940,7 +963,7 @@ static int prune_refs(struct refspec *refs, int ref_count, struct ref *ref_map,
 		for (ref = stale_refs; ref; ref = ref->next)
 			string_list_append(&refnames, ref->name);
 
-		result = delete_refs(&refnames, 0);
+		result = delete_refs("fetch: prune", &refnames, 0);
 		string_list_clear(&refnames, 0);
 	}
 
@@ -1071,9 +1094,6 @@ static int do_fetch(struct transport *transport,
 		if (transport->remote->fetch_tags == -1)
 			tags = TAGS_UNSET;
 	}
-
-	if (!transport->get_refs_list || !transport->fetch)
-		die(_("Don't know how to fetch from %s"), transport->url);
 
 	/* if not appending, truncate FETCH_HEAD */
 	if (!append && !dry_run) {
@@ -1311,6 +1331,7 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 	for (i = 1; i < argc; i++)
 		strbuf_addf(&default_rla, " %s", argv[i]);
 
+	config_from_gitmodules(gitmodules_fetch_config, NULL);
 	git_config(git_fetch_config, NULL);
 
 	argc = parse_options(argc, argv, prefix,
@@ -1337,15 +1358,6 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 		die(_("depth %s is not a positive number"), depth);
 	if (depth || deepen_since || deepen_not.nr)
 		deepen = 1;
-
-	if (recurse_submodules != RECURSE_SUBMODULES_OFF) {
-		if (recurse_submodules_default) {
-			int arg = parse_fetch_recurse_submodules_arg("--recurse-submodules-default", recurse_submodules_default);
-			set_config_fetch_recurse_submodules(arg);
-		}
-		gitmodules_config();
-		git_config(submodule_config, NULL);
-	}
 
 	if (all) {
 		if (argc == 1)
@@ -1383,9 +1395,11 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 		struct argv_array options = ARGV_ARRAY_INIT;
 
 		add_options_to_argv(&options);
-		result = fetch_populated_submodules(&options,
+		result = fetch_populated_submodules(the_repository,
+						    &options,
 						    submodule_prefix,
 						    recurse_submodules,
+						    recurse_submodules_default,
 						    verbosity < 0,
 						    max_children);
 		argv_array_clear(&options);

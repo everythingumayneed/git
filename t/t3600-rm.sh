@@ -97,9 +97,9 @@ test_expect_success FUNNYNAMES \
 embedded'"
 
 test_expect_success SANITY 'Test that "git rm -f" fails if its rm fails' '
+	test_when_finished "chmod 775 ." &&
 	chmod a-w . &&
-	test_must_fail git rm -f baz &&
-	chmod 775 .
+	test_must_fail git rm -f baz
 '
 
 test_expect_success \
@@ -688,7 +688,7 @@ test_expect_success 'checking out a commit after submodule removal needs manual 
 	git submodule update &&
 	git checkout -q HEAD^ &&
 	git checkout -q master 2>actual &&
-	test_i18ngrep "^warning: unable to rmdir submod:" actual &&
+	test_i18ngrep "^warning: unable to rmdir '\''submod'\'':" actual &&
 	git status -s submod >actual &&
 	echo "?? submod/" >expected &&
 	test_cmp expected actual &&
@@ -858,9 +858,8 @@ test_expect_success 'rm files with two different errors' '
 	test_i18ncmp expect actual
 '
 
-test_expect_success 'rm empty string should invoke warning' '
-	git rm -rf "" 2>output &&
-	test_i18ngrep "warning: empty strings" output
+test_expect_success 'rm empty string should fail' '
+	test_must_fail git rm -rf ""
 '
 
 test_done

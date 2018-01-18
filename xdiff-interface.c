@@ -1,9 +1,11 @@
 #include "cache.h"
+#include "config.h"
 #include "xdiff-interface.h"
 #include "xdiff/xtypes.h"
 #include "xdiff/xdiffi.h"
 #include "xdiff/xemit.h"
 #include "xdiff/xmacros.h"
+#include "xdiff/xutils.h"
 
 struct xdiff_emit_state {
 	xdiff_emit_consume_fn consume;
@@ -164,9 +166,9 @@ int read_mmfile(mmfile_t *ptr, const char *filename)
 	size_t sz;
 
 	if (stat(filename, &st))
-		return error("Could not stat %s", filename);
+		return error_errno("Could not stat %s", filename);
 	if ((f = fopen(filename, "rb")) == NULL)
-		return error("Could not open %s", filename);
+		return error_errno("Could not open %s", filename);
 	sz = xsize_t(st.st_size);
 	ptr->ptr = xmalloc(sz ? sz : 1);
 	if (sz && fread(ptr->ptr, sz, 1, f) != 1) {
@@ -293,6 +295,17 @@ void xdiff_clear_find_func(xdemitconf_t *xecfg)
 		xecfg->find_func = NULL;
 		xecfg->find_func_priv = NULL;
 	}
+}
+
+unsigned long xdiff_hash_string(const char *s, size_t len, long flags)
+{
+	return xdl_hash_record(&s, s + len, flags);
+}
+
+int xdiff_compare_lines(const char *l1, long s1,
+			const char *l2, long s2, long flags)
+{
+	return xdl_recmatch(l1, s1, l2, s2, flags);
 }
 
 int git_xmerge_style = -1;

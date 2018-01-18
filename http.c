@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "http.h"
+#include "config.h"
 #include "pack.h"
 #include "sideband.h"
 #include "run-command.h"
@@ -10,6 +11,8 @@
 #include "pkt-line.h"
 #include "gettext.h"
 #include "transport.h"
+#include "packfile.h"
+#include "protocol.h"
 
 static struct trace_key trace_curl = TRACE_KEY_INIT(CURL);
 #if LIBCURL_VERSION_NUM >= 0x070a08
@@ -90,7 +93,7 @@ static struct {
 	 * here, too
 	 */
 };
-#if LIBCURL_VERSION_NUM >= 0x071600
+#ifdef CURLGSSAPI_DELEGATION_FLAG
 static const char *curl_deleg;
 static struct {
 	const char *name;
@@ -271,10 +274,10 @@ static int http_options(const char *var, const char *value, void *cb)
 	if (!strcmp("http.sslversion", var))
 		return git_config_string(&ssl_version, var, value);
 	if (!strcmp("http.sslcert", var))
-		return git_config_string(&ssl_cert, var, value);
+		return git_config_pathname(&ssl_cert, var, value);
 #if LIBCURL_VERSION_NUM >= 0x070903
 	if (!strcmp("http.sslkey", var))
-		return git_config_string(&ssl_key, var, value);
+		return git_config_pathname(&ssl_key, var, value);
 #endif
 #if LIBCURL_VERSION_NUM >= 0x070908
 	if (!strcmp("http.sslcapath", var))
@@ -351,7 +354,7 @@ static int http_options(const char *var, const char *value, void *cb)
 	}
 
 	if (!strcmp("http.delegation", var)) {
-#if LIBCURL_VERSION_NUM >= 0x071600
+#ifdef CURLGSSAPI_DELEGATION_FLAG
 		return git_config_string(&curl_deleg, var, value);
 #else
 		warning(_("Delegation control is not supported with cURL < 7.22.0"));
@@ -636,9 +639,7 @@ static int curl_trace(CURL *handle, curl_infotype type, char *data, size_t size,
 	switch (type) {
 	case CURLINFO_TEXT:
 		trace_printf_key(&trace_curl, "== Info: %s", data);
-	default:		/* we ignore unknown types by default */
-		return 0;
-
+		break;
 	case CURLINFO_HEADER_OUT:
 		text = "=> Send header";
 		curl_dump_header(text, (unsigned char *)data, size, DO_FILTER);
@@ -663,6 +664,9 @@ static int curl_trace(CURL *handle, curl_infotype type, char *data, size_t size,
 		text = "<= Recv SSL data";
 		curl_dump_data(text, (unsigned char *)data, size);
 		break;
+
+	default:		/* we ignore unknown types by default */
+		return 0;
 	}
 	return 0;
 }
@@ -676,6 +680,7 @@ void setup_curl_trace(CURL *handle)
 	curl_easy_setopt(handle, CURLOPT_DEBUGDATA, NULL);
 }
 
+#ifdef CURLPROTO_HTTP
 static long get_curl_allowed_protocols(int from_user)
 {
 	long allowed_protocols = 0;
@@ -691,6 +696,7 @@ static long get_curl_allowed_protocols(int from_user)
 
 	return allowed_protocols;
 }
+#endif
 
 static CURL *get_curl_handle(void)
 {
@@ -716,7 +722,7 @@ static CURL *get_curl_handle(void)
 	curl_easy_setopt(result, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
 #endif
 
-#if LIBCURL_VERSION_NUM >= 0x071600
+#ifdef CURLGSSAPI_DELEGATION_FLAG
 	if (curl_deleg) {
 		int i;
 		for (i = 0; i < ARRAY_SIZE(curl_deleg_levels); i++) {
@@ -789,7 +795,7 @@ static CURL *get_curl_handle(void)
 #elif LIBCURL_VERSION_NUM >= 0x071101
 	curl_easy_setopt(result, CURLOPT_POST301, 1);
 #endif
-#if LIBCURL_VERSION_NUM >= 0x071304
+#ifdef CURLPROTO_HTTP
 	curl_easy_setopt(result, CURLOPT_REDIR_PROTOCOLS,
 			 get_curl_allowed_protocols(0));
 	curl_easy_setopt(result, CURLOPT_PROTOCOLS,
@@ -860,6 +866,11 @@ static CURL *get_curl_handle(void)
 			curl_easy_setopt(result,
 				CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
 #endif
+#if LIBCURL_VERSION_NUM >= 0x073400
+		else if (starts_with(curl_http_proxy, "https"))
+			curl_easy_setopt(result,
+				CURLOPT_PROXYTYPE, CURLPROXY_HTTPS);
+#endif
 		if (strstr(curl_http_proxy, "://"))
 			credential_from_url(&proxy_auth, curl_http_proxy);
 		else {
@@ -893,6 +904,21 @@ static void set_from_env(const char **var, const char *envname)
 		*var = val;
 }
 
+static void protocol_http_header(void)
+{
+	if (get_protocol_version_config() > 0) {
+		struct strbuf protocol_header = STRBUF_INIT;
+
+		strbuf_addf(&protocol_header, GIT_PROTOCOL_HEADER ": version=%d",
+			    get_protocol_version_config());
+
+
+		extra_http_headers = curl_slist_append(extra_http_headers,
+						       protocol_header.buf);
+		strbuf_release(&protocol_header);
+	}
+}
+
 void http_init(struct remote *remote, const char *url, int proactive_auth)
 {
 	char *low_speed_limit;
@@ -922,6 +948,8 @@ void http_init(struct remote *remote, const char *url, int proactive_auth)
 
 	if (remote)
 		var_override(&http_proxy_authmethod, remote->http_proxy_authmethod);
+
+	protocol_http_header();
 
 	pragma_header = curl_slist_append(http_copy_default_headers(),
 		"Pragma: no-cache");
@@ -1026,8 +1054,7 @@ void http_cleanup(void)
 
 	if (proxy_auth.password) {
 		memset(proxy_auth.password, 0, strlen(proxy_auth.password));
-		free(proxy_auth.password);
-		proxy_auth.password = NULL;
+		FREE_AND_NULL(proxy_auth.password);
 	}
 
 	free((void *)curl_proxyuserpwd);
@@ -1038,13 +1065,11 @@ void http_cleanup(void)
 
 	if (cert_auth.password != NULL) {
 		memset(cert_auth.password, 0, strlen(cert_auth.password));
-		free(cert_auth.password);
-		cert_auth.password = NULL;
+		FREE_AND_NULL(cert_auth.password);
 	}
 	ssl_cert_password_required = 0;
 
-	free(cached_accept_language);
-	cached_accept_language = NULL;
+	FREE_AND_NULL(cached_accept_language);
 }
 
 struct active_request_slot *get_active_slot(void)
@@ -1896,8 +1921,7 @@ static char *fetch_pack_index(unsigned char *sha1, const char *base_url)
 
 	if (http_get_file(url, tmp, NULL) != HTTP_OK) {
 		error("Unable to get pack index %s", url);
-		free(tmp);
-		tmp = NULL;
+		FREE_AND_NULL(tmp);
 	}
 
 	free(url);
@@ -2006,7 +2030,6 @@ int finish_http_pack_request(struct http_pack_request *preq)
 	char *tmp_idx;
 	size_t len;
 	struct child_process ip = CHILD_PROCESS_INIT;
-	const char *ip_argv[8];
 
 	close_pack_index(p);
 
@@ -2022,13 +2045,9 @@ int finish_http_pack_request(struct http_pack_request *preq)
 		die("BUG: pack tmpfile does not end in .pack.temp?");
 	tmp_idx = xstrfmt("%.*s.idx.temp", (int)len, preq->tmpfile);
 
-	ip_argv[0] = "index-pack";
-	ip_argv[1] = "-o";
-	ip_argv[2] = tmp_idx;
-	ip_argv[3] = preq->tmpfile;
-	ip_argv[4] = NULL;
-
-	ip.argv = ip_argv;
+	argv_array_push(&ip.args, "index-pack");
+	argv_array_pushl(&ip.args, "-o", tmp_idx, NULL);
+	argv_array_push(&ip.args, preq->tmpfile);
 	ip.git_cmd = 1;
 	ip.no_stdin = 1;
 	ip.no_stdout = 1;
@@ -2328,8 +2347,7 @@ void release_http_object_request(struct http_object_request *freq)
 		freq->localfile = -1;
 	}
 	if (freq->url != NULL) {
-		free(freq->url);
-		freq->url = NULL;
+		FREE_AND_NULL(freq->url);
 	}
 	if (freq->slot != NULL) {
 		freq->slot->callback_func = NULL;

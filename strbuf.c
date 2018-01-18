@@ -11,6 +11,28 @@ int starts_with(const char *str, const char *prefix)
 			return 0;
 }
 
+int skip_to_optional_arg_default(const char *str, const char *prefix,
+				 const char **arg, const char *def)
+{
+	const char *p;
+
+	if (!skip_prefix(str, prefix, &p))
+		return 0;
+
+	if (!*p) {
+		if (arg)
+			*arg = def;
+		return 1;
+	}
+
+	if (*p != '=')
+		return 0;
+
+	if (arg)
+		*arg = p + 1;
+	return 1;
+}
+
 /*
  * Used as the default ->buf value, so that people can always assume
  * buf is non NULL and ->buf is NUL terminated even for a freshly
@@ -386,12 +408,15 @@ ssize_t strbuf_read(struct strbuf *sb, int fd, size_t hint)
 
 ssize_t strbuf_read_once(struct strbuf *sb, int fd, size_t hint)
 {
+	size_t oldalloc = sb->alloc;
 	ssize_t cnt;
 
 	strbuf_grow(sb, hint ? hint : 8192);
 	cnt = xread(fd, sb->buf + sb->len, sb->alloc - sb->len - 1);
 	if (cnt > 0)
 		strbuf_setlen(sb, sb->len + cnt);
+	else if (oldalloc == 0)
+		strbuf_release(sb);
 	return cnt;
 }
 
@@ -476,6 +501,7 @@ int strbuf_getwholeline(struct strbuf *sb, FILE *fp, int term)
 	/* Translate slopbuf to NULL, as we cannot call realloc on it */
 	if (!sb->alloc)
 		sb->buf = NULL;
+	errno = 0;
 	r = getdelim(&sb->buf, &sb->alloc, term, fp);
 
 	if (r > 0) {
@@ -657,7 +683,7 @@ static void strbuf_add_urlencode(struct strbuf *sb, const char *s, size_t len,
 		    (!reserved && is_rfc3986_reserved(ch)))
 			strbuf_addch(sb, ch);
 		else
-			strbuf_addf(sb, "%%%02x", ch);
+			strbuf_addf(sb, "%%%02x", (unsigned char)ch);
 	}
 }
 
@@ -778,13 +804,46 @@ char *xstrfmt(const char *fmt, ...)
 	return ret;
 }
 
-void strbuf_addftime(struct strbuf *sb, const char *fmt, const struct tm *tm)
+void strbuf_addftime(struct strbuf *sb, const char *fmt, const struct tm *tm,
+		     int tz_offset, int suppress_tz_name)
 {
+	struct strbuf munged_fmt = STRBUF_INIT;
 	size_t hint = 128;
 	size_t len;
 
 	if (!*fmt)
 		return;
+
+	/*
+	 * There is no portable way to pass timezone information to
+	 * strftime, so we handle %z and %Z here.
+	 */
+	for (;;) {
+		const char *percent = strchrnul(fmt, '%');
+		strbuf_add(&munged_fmt, fmt, percent - fmt);
+		if (!*percent)
+			break;
+		fmt = percent + 1;
+		switch (*fmt) {
+		case '%':
+			strbuf_addstr(&munged_fmt, "%%");
+			fmt++;
+			break;
+		case 'z':
+			strbuf_addf(&munged_fmt, "%+05d", tz_offset);
+			fmt++;
+			break;
+		case 'Z':
+			if (suppress_tz_name) {
+				fmt++;
+				break;
+			}
+			/* FALLTHROUGH */
+		default:
+			strbuf_addch(&munged_fmt, '%');
+		}
+	}
+	fmt = munged_fmt.buf;
 
 	strbuf_grow(sb, hint);
 	len = strftime(sb->buf + sb->len, sb->alloc - sb->len, fmt, tm);
@@ -797,17 +856,16 @@ void strbuf_addftime(struct strbuf *sb, const char *fmt, const struct tm *tm)
 		 * output contains at least one character, and then drop the extra
 		 * character before returning.
 		 */
-		struct strbuf munged_fmt = STRBUF_INIT;
-		strbuf_addf(&munged_fmt, "%s ", fmt);
+		strbuf_addch(&munged_fmt, ' ');
 		while (!len) {
 			hint *= 2;
 			strbuf_grow(sb, hint);
 			len = strftime(sb->buf + sb->len, sb->alloc - sb->len,
 				       munged_fmt.buf, tm);
 		}
-		strbuf_release(&munged_fmt);
 		len--; /* drop munged space */
 	}
+	strbuf_release(&munged_fmt);
 	strbuf_setlen(sb, sb->len + len);
 }
 

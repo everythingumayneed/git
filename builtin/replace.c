@@ -9,6 +9,7 @@
  */
 
 #include "cache.h"
+#include "config.h"
 #include "builtin.h"
 #include "refs.h"
 #include "parse-options.h"
@@ -40,7 +41,7 @@ static int show_reference(const char *refname, const struct object_id *oid,
 {
 	struct show_data *data = cb_data;
 
-	if (!wildmatch(data->pattern, refname, 0, NULL)) {
+	if (!wildmatch(data->pattern, refname, 0)) {
 		if (data->format == REPLACE_FORMAT_SHORT)
 			printf("%s\n", refname);
 		else if (data->format == REPLACE_FORMAT_MEDIUM)
@@ -49,7 +50,7 @@ static int show_reference(const char *refname, const struct object_id *oid,
 			struct object_id object;
 			enum object_type obj_type, repl_type;
 
-			if (get_sha1(refname, object.hash))
+			if (get_oid(refname, &object))
 				return error("Failed to resolve '%s' as a valid ref.", refname);
 
 			obj_type = sha1_object_info(object.hash, NULL);
@@ -112,7 +113,7 @@ static int for_each_replace_name(const char **argv, each_replace_name_fn fn)
 		strbuf_addstr(&ref, oid_to_hex(&oid));
 		full_hex = ref.buf + base_len;
 
-		if (read_ref(ref.buf, oid.hash)) {
+		if (read_ref(ref.buf, &oid)) {
 			error("replace ref '%s' not found.", full_hex);
 			had_error = 1;
 			continue;
@@ -127,7 +128,7 @@ static int for_each_replace_name(const char **argv, each_replace_name_fn fn)
 static int delete_replace_ref(const char *name, const char *ref,
 			      const struct object_id *oid)
 {
-	if (delete_ref(NULL, ref, oid->hash, 0))
+	if (delete_ref(NULL, ref, oid, 0))
 		return 1;
 	printf("Deleted replace ref '%s'\n", name);
 	return 0;
@@ -143,7 +144,7 @@ static void check_ref_valid(struct object_id *object,
 	if (check_refname_format(ref->buf, 0))
 		die("'%s' is not a valid ref name.", ref->buf);
 
-	if (read_ref(ref->buf, prev->hash))
+	if (read_ref(ref->buf, prev))
 		oidclr(prev);
 	else if (!force)
 		die("replace ref '%s' already exists", ref->buf);
@@ -174,7 +175,7 @@ static int replace_object_oid(const char *object_ref,
 
 	transaction = ref_transaction_begin(&err);
 	if (!transaction ||
-	    ref_transaction_update(transaction, ref.buf, repl->hash, prev.hash,
+	    ref_transaction_update(transaction, ref.buf, repl, &prev,
 				   0, NULL, &err) ||
 	    ref_transaction_commit(transaction, &err))
 		die("%s", err.buf);
@@ -268,7 +269,7 @@ static void import_object(struct object_id *oid, enum object_type type,
 
 		if (fstat(fd, &st) < 0)
 			die_errno("unable to fstat %s", filename);
-		if (index_fd(oid->hash, fd, &st, type, NULL, flags) < 0)
+		if (index_fd(oid, fd, &st, type, NULL, flags) < 0)
 			die("unable to write object to database");
 		/* index_fd close()s fd for us */
 	}
@@ -328,7 +329,7 @@ static void replace_parents(struct strbuf *buf, int argc, const char **argv)
 		struct object_id oid;
 		if (get_oid(argv[i], &oid) < 0)
 			die(_("Not a valid object name: '%s'"), argv[i]);
-		lookup_commit_or_die(oid.hash, argv[i]);
+		lookup_commit_or_die(&oid, argv[i]);
 		strbuf_addf(&new_parents, "parent %s\n", oid_to_hex(&oid));
 	}
 
@@ -355,7 +356,7 @@ static void check_one_mergetag(struct commit *commit,
 	int i;
 
 	hash_sha1_file(extra->value, extra->len, typename(OBJ_TAG), tag_oid.hash);
-	tag = lookup_tag(tag_oid.hash);
+	tag = lookup_tag(&tag_oid);
 	if (!tag)
 		die(_("bad mergetag in commit '%s'"), ref);
 	if (parse_tag_buffer(tag, extra->value, extra->len))
@@ -364,7 +365,7 @@ static void check_one_mergetag(struct commit *commit,
 	/* iterate over new parents */
 	for (i = 1; i < mergetag_data->argc; i++) {
 		struct object_id oid;
-		if (get_sha1(mergetag_data->argv[i], oid.hash) < 0)
+		if (get_oid(mergetag_data->argv[i], &oid) < 0)
 			die(_("Not a valid object name: '%s'"), mergetag_data->argv[i]);
 		if (!oidcmp(&tag->tagged->oid, &oid))
 			return; /* found */
@@ -394,7 +395,7 @@ static int create_graft(int argc, const char **argv, int force)
 
 	if (get_oid(old_ref, &old) < 0)
 		die(_("Not a valid object name: '%s'"), old_ref);
-	commit = lookup_commit_or_die(old.hash, old_ref);
+	commit = lookup_commit_or_die(&old, old_ref);
 
 	buffer = get_commit_buffer(commit, &size);
 	strbuf_add(&buf, buffer, size);

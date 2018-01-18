@@ -1,4 +1,5 @@
 #include "builtin.h"
+#include "config.h"
 #include "commit.h"
 #include "refs.h"
 #include "pkt-line.h"
@@ -57,35 +58,25 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *extra, struc
 	 * the revision parameters to it via its stdin and
 	 * let its stdout go back to the other end.
 	 */
-	const char *argv[] = {
-		"pack-objects",
-		"--all-progress-implied",
-		"--revs",
-		"--stdout",
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-	};
 	struct child_process po = CHILD_PROCESS_INIT;
 	FILE *po_in;
 	int i;
 	int rc;
 
-	i = 4;
+	argv_array_push(&po.args, "pack-objects");
+	argv_array_push(&po.args, "--all-progress-implied");
+	argv_array_push(&po.args, "--revs");
+	argv_array_push(&po.args, "--stdout");
 	if (args->use_thin_pack)
-		argv[i++] = "--thin";
+		argv_array_push(&po.args, "--thin");
 	if (args->use_ofs_delta)
-		argv[i++] = "--delta-base-offset";
+		argv_array_push(&po.args, "--delta-base-offset");
 	if (args->quiet || !args->progress)
-		argv[i++] = "-q";
+		argv_array_push(&po.args, "-q");
 	if (args->progress)
-		argv[i++] = "--progress";
+		argv_array_push(&po.args, "--progress");
 	if (is_repository_shallow())
-		argv[i++] = "--shallow";
-	po.argv = argv;
+		argv_array_push(&po.args, "--shallow");
 	po.in = -1;
 	po.out = args->stateless_rpc ? -1 : fd;
 	po.git_cmd = 1;
@@ -132,7 +123,7 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *extra, struc
 		 * For a normal non-zero exit, we assume pack-objects wrote
 		 * something useful to stderr. For death by signal, though,
 		 * we should mention it to the user. The exception is SIGPIPE
-		 * (141), because that's a normal occurence if the remote end
+		 * (141), because that's a normal occurrence if the remote end
 		 * hangs up (and we'll report that by trying to read the unpack
 		 * status).
 		 */
@@ -491,9 +482,12 @@ int send_pack(struct send_pack_args *args,
 			 * we were to send it and we're trying to send the refs
 			 * atomically, abort the whole operation.
 			 */
-			if (use_atomic)
+			if (use_atomic) {
+				strbuf_release(&req_buf);
+				strbuf_release(&cap_buf);
 				return atomic_push_failure(args, remote_refs, ref);
-			/* Fallthrough for non atomic case. */
+			}
+			/* else fallthrough */
 		default:
 			continue;
 		}

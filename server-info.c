@@ -3,6 +3,7 @@
 #include "object.h"
 #include "commit.h"
 #include "tag.h"
+#include "packfile.h"
 
 /*
  * Create the file "path" by writing to a temporary file and renaming
@@ -53,7 +54,7 @@ static int add_info_ref(const char *path, const struct object_id *oid,
 			int flag, void *cb_data)
 {
 	FILE *fp = cb_data;
-	struct object *o = parse_object(oid->hash);
+	struct object *o = parse_object(oid);
 	if (!o)
 		return -1;
 
@@ -133,7 +134,7 @@ static int read_pack_info_file(const char *infofile)
 	char line[1000];
 	int old_cnt = 0;
 
-	fp = fopen(infofile, "r");
+	fp = fopen_or_warn(infofile, "r");
 	if (!fp)
 		return 1; /* nonexistent is not an error. */
 

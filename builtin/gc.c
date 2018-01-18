@@ -11,6 +11,7 @@
  */
 
 #include "builtin.h"
+#include "config.h"
 #include "tempfile.h"
 #include "lockfile.h"
 #include "parse-options.h"
@@ -18,6 +19,7 @@
 #include "sigchain.h"
 #include "argv-array.h"
 #include "commit.h"
+#include "packfile.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -33,7 +35,7 @@ static int aggressive_window = 250;
 static int gc_auto_threshold = 6700;
 static int gc_auto_pack_limit = 50;
 static int detach_auto = 1;
-static unsigned long gc_log_expire_time;
+static timestamp_t gc_log_expire_time;
 static const char *gc_log_expire = "1.day.ago";
 static const char *prune_expire = "2.weeks.ago";
 static const char *prune_worktrees_expire = "3.months.ago";
@@ -45,7 +47,7 @@ static struct argv_array prune = ARGV_ARRAY_INIT;
 static struct argv_array prune_worktrees = ARGV_ARRAY_INIT;
 static struct argv_array rerere = ARGV_ARRAY_INIT;
 
-static struct tempfile pidfile;
+static struct tempfile *pidfile;
 static struct lock_file log_lock;
 
 static struct string_list pack_garbage = STRING_LIST_INIT_DUP;
@@ -76,7 +78,7 @@ static void process_log_file(void)
 		 */
 		int saved_errno = errno;
 		fprintf(stderr, _("Failed to fstat %s: %s"),
-			get_tempfile_path(&log_lock.tempfile),
+			get_tempfile_path(log_lock.tempfile),
 			strerror(saved_errno));
 		fflush(stderr);
 		commit_lock_file(&log_lock);
@@ -148,7 +150,7 @@ static int too_many_loose_objects(void)
 	if (!dir)
 		return 0;
 
-	auto_threshold = (gc_auto_threshold + 255) / 256;
+	auto_threshold = DIV_ROUND_UP(gc_auto_threshold, 256);
 	while ((ent = readdir(dir)) != NULL) {
 		if (strspn(ent->d_name, "0123456789abcdef") != 38 ||
 		    ent->d_name[38] != '\0')
@@ -240,7 +242,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 	int fd;
 	char *pidfile_path;
 
-	if (is_tempfile_active(&pidfile))
+	if (is_tempfile_active(pidfile))
 		/* already locked */
 		return NULL;
 
@@ -256,7 +258,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 		int should_exit;
 
 		if (!scan_fmt)
-			scan_fmt = xstrfmt("%s %%%dc", "%"SCNuMAX, HOST_NAME_MAX);
+			scan_fmt = xstrfmt("%s %%%ds", "%"SCNuMAX, HOST_NAME_MAX);
 		fp = fopen(pidfile_path, "r");
 		memset(locking_host, 0, sizeof(locking_host));
 		should_exit =
@@ -291,7 +293,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 	write_in_full(fd, sb.buf, sb.len);
 	strbuf_release(&sb);
 	commit_lock_file(&lock);
-	register_tempfile(&pidfile, pidfile_path);
+	pidfile = register_tempfile(pidfile_path);
 	free(pidfile_path);
 	return NULL;
 }
@@ -413,8 +415,12 @@ int cmd_gc(int argc, const char **argv, const char *prefix)
 			if (report_last_gc_error())
 				return -1;
 
+			if (lock_repo_for_gc(force, &pid))
+				return 0;
 			if (gc_before_repack())
 				return -1;
+			delete_tempfile(&pidfile);
+
 			/*
 			 * failure to daemonize is ok, we'll continue
 			 * in foreground

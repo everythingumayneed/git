@@ -139,6 +139,8 @@ struct untracked_cache {
 	int gitignore_invalidated;
 	int dir_invalidated;
 	int dir_opened;
+	/* fsmonitor invalidation data */
+	unsigned int use_fsmonitor : 1;
 };
 
 struct dir_struct {
@@ -152,7 +154,8 @@ struct dir_struct {
 		DIR_COLLECT_IGNORED = 1<<4,
 		DIR_SHOW_IGNORED_TOO = 1<<5,
 		DIR_COLLECT_KILLED_ONLY = 1<<6,
-		DIR_KEEP_UNTRACKED_CONTENTS = 1<<7
+		DIR_KEEP_UNTRACKED_CONTENTS = 1<<7,
+		DIR_SHOW_IGNORED_TOO_MODE_MATCHING = 1<<8
 	} flags;
 	struct dir_entry **entries;
 	struct dir_entry **ignored;
@@ -197,6 +200,9 @@ struct dir_struct {
 	unsigned unmanaged_exclude_files;
 };
 
+/*Count the number of slashes for string s*/
+extern int count_slashes(const char *s);
+
 /*
  * The ordering of these constants is significant, with
  * higher-numbered match types signifying "closer" (i.e. more
@@ -215,12 +221,20 @@ extern int match_pathspec(const struct pathspec *pathspec,
 extern int report_path_error(const char *ps_matched, const struct pathspec *pathspec, const char *prefix);
 extern int within_depth(const char *name, int namelen, int depth, int max_depth);
 
-extern int fill_directory(struct dir_struct *dir, const struct pathspec *pathspec);
-extern int read_directory(struct dir_struct *, const char *path, int len, const struct pathspec *pathspec);
+extern int fill_directory(struct dir_struct *dir,
+			  struct index_state *istate,
+			  const struct pathspec *pathspec);
+extern int read_directory(struct dir_struct *, struct index_state *istate,
+			  const char *path, int len,
+			  const struct pathspec *pathspec);
 
-extern int is_excluded_from_list(const char *pathname, int pathlen, const char *basename,
-				 int *dtype, struct exclude_list *el);
-struct dir_entry *dir_add_ignored(struct dir_struct *dir, const char *pathname, int len);
+extern int is_excluded_from_list(const char *pathname, int pathlen,
+				 const char *basename, int *dtype,
+				 struct exclude_list *el,
+				 struct index_state *istate);
+struct dir_entry *dir_add_ignored(struct dir_struct *dir,
+				  struct index_state *istate,
+				  const char *pathname, int len);
 
 /*
  * these implement the matching logic for dir.c:excluded_from_list and
@@ -233,15 +247,21 @@ extern int match_pathname(const char *, int,
 			  const char *, int, int, unsigned);
 
 extern struct exclude *last_exclude_matching(struct dir_struct *dir,
+					     struct index_state *istate,
 					     const char *name, int *dtype);
 
-extern int is_excluded(struct dir_struct *dir, const char *name, int *dtype);
+extern int is_excluded(struct dir_struct *dir,
+		       struct index_state *istate,
+		       const char *name, int *dtype);
 
 extern struct exclude_list *add_exclude_list(struct dir_struct *dir,
 					     int group_type, const char *src);
 extern int add_excludes_from_file_to_list(const char *fname, const char *base, int baselen,
-					  struct exclude_list *el, int check_index);
+					  struct exclude_list *el, struct  index_state *istate);
 extern void add_excludes_from_file(struct dir_struct *, const char *fname);
+extern int add_excludes_from_blob_to_list(struct object_id *oid,
+					  const char *base, int baselen,
+					  struct exclude_list *el);
 extern void parse_exclude_pattern(const char **string, int *patternlen, unsigned *flags, int *nowildcardlen);
 extern void add_exclude(const char *string, const char *base,
 			int baselen, struct exclude_list *el, int srcpos);

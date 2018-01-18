@@ -13,7 +13,7 @@ static int sha1_compare(const void *_a, const void *_b)
 {
 	struct pack_idx_entry *a = *(struct pack_idx_entry **)_a;
 	struct pack_idx_entry *b = *(struct pack_idx_entry **)_b;
-	return hashcmp(a->sha1, b->sha1);
+	return oidcmp(&a->oid, &b->oid);
 }
 
 static int cmp_uint32(const void *a_, const void *b_)
@@ -103,7 +103,7 @@ const char *write_idx_file(const char *index_name, struct pack_idx_entry **objec
 		struct pack_idx_entry **next = list;
 		while (next < last) {
 			struct pack_idx_entry *obj = *next;
-			if (obj->sha1[0] != i)
+			if (obj->oid.hash[0] != i)
 				break;
 			next++;
 		}
@@ -122,11 +122,11 @@ const char *write_idx_file(const char *index_name, struct pack_idx_entry **objec
 			uint32_t offset = htonl(obj->offset);
 			sha1write(f, &offset, 4);
 		}
-		sha1write(f, obj->sha1, 20);
+		sha1write(f, obj->oid.hash, 20);
 		if ((opts->flags & WRITE_IDX_STRICT) &&
-		    (i && !hashcmp(list[-2]->sha1, obj->sha1)))
+		    (i && !oidcmp(&list[-2]->oid, &obj->oid)))
 			die("The same object %s appears twice in the pack",
-			    sha1_to_hex(obj->sha1));
+			    oid_to_hex(&obj->oid));
 	}
 
 	if (index_version >= 2) {
@@ -213,14 +213,19 @@ void fixup_pack_header_footer(int pack_fd,
 	git_SHA_CTX old_sha1_ctx, new_sha1_ctx;
 	struct pack_header hdr;
 	char *buf;
+	ssize_t read_result;
 
 	git_SHA1_Init(&old_sha1_ctx);
 	git_SHA1_Init(&new_sha1_ctx);
 
 	if (lseek(pack_fd, 0, SEEK_SET) != 0)
 		die_errno("Failed seeking to start of '%s'", pack_name);
-	if (read_in_full(pack_fd, &hdr, sizeof(hdr)) != sizeof(hdr))
+	read_result = read_in_full(pack_fd, &hdr, sizeof(hdr));
+	if (read_result < 0)
 		die_errno("Unable to reread header of '%s'", pack_name);
+	else if (read_result != sizeof(hdr))
+		die_errno("Unexpected short read for header of '%s'",
+			  pack_name);
 	if (lseek(pack_fd, 0, SEEK_SET) != 0)
 		die_errno("Failed seeking to start of '%s'", pack_name);
 	git_SHA1_Update(&old_sha1_ctx, &hdr, sizeof(hdr));

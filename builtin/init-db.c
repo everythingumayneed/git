@@ -4,6 +4,7 @@
  * Copyright (C) Linus Torvalds, 2005
  */
 #include "cache.h"
+#include "config.h"
 #include "refs.h"
 #include "builtin.h"
 #include "exec_cmd.h"
@@ -577,6 +578,8 @@ int cmd_init_db(int argc, const char **argv, const char *prefix)
 		if (work_tree)
 			set_git_work_tree(work_tree);
 	}
+
+	UNLEAK(real_git_dir);
 
 	flags |= INIT_DB_EXIST_OK;
 	return init_db(git_dir, real_git_dir, template_dir, flags);

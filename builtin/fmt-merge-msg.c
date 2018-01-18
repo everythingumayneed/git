@@ -1,5 +1,6 @@
 #include "builtin.h"
 #include "cache.h"
+#include "config.h"
 #include "refs.h"
 #include "commit.h"
 #include "diff.h"
@@ -341,7 +342,7 @@ static void shortlog(const char *name,
 	const struct object_id *oid = &origin_data->oid;
 	int limit = opts->shortlog_len;
 
-	branch = deref_tag(parse_object(oid->hash), oid_to_hex(oid), GIT_SHA1_HEXSZ);
+	branch = deref_tag(parse_object(oid), oid_to_hex(oid), GIT_SHA1_HEXSZ);
 	if (!branch || branch->type != OBJ_COMMIT)
 		return;
 
@@ -376,7 +377,8 @@ static void shortlog(const char *name,
 			string_list_append(&subjects,
 					   oid_to_hex(&commit->object.oid));
 		else
-			string_list_append(&subjects, strbuf_detach(&sb, NULL));
+			string_list_append_nodup(&subjects,
+						 strbuf_detach(&sb, NULL));
 	}
 
 	if (opts->credit_people)
@@ -407,7 +409,8 @@ static void shortlog(const char *name,
 }
 
 static void fmt_merge_msg_title(struct strbuf *out,
-	const char *current_branch) {
+				const char *current_branch)
+{
 	int i = 0;
 	char *sep = "";
 
@@ -559,17 +562,17 @@ static void find_merge_parents(struct merge_parents *result,
 		 * "name" here and we do not want to contaminate its
 		 * util field yet.
 		 */
-		obj = parse_object(oid.hash);
+		obj = parse_object(&oid);
 		parent = (struct commit *)peel_to_type(NULL, 0, obj, OBJ_COMMIT);
 		if (!parent)
 			continue;
 		commit_list_insert(parent, &parents);
 		add_merge_parent(result, &obj->oid, &parent->object.oid);
 	}
-	head_commit = lookup_commit(head->hash);
+	head_commit = lookup_commit(head);
 	if (head_commit)
 		commit_list_insert(head_commit, &parents);
-	parents = reduce_heads(parents);
+	reduce_heads_replace(&parents);
 
 	while (parents) {
 		struct commit *cmit = pop_commit(&parents);
@@ -601,7 +604,7 @@ int fmt_merge_msg(struct strbuf *in, struct strbuf *out,
 
 	/* get current branch */
 	current_branch = current_branch_to_free =
-		resolve_refdup("HEAD", RESOLVE_REF_READING, head_oid.hash, NULL);
+		resolve_refdup("HEAD", RESOLVE_REF_READING, &head_oid, NULL);
 	if (!current_branch)
 		die("No current branch");
 	if (starts_with(current_branch, "refs/heads/"))
@@ -633,7 +636,7 @@ int fmt_merge_msg(struct strbuf *in, struct strbuf *out,
 		struct commit *head;
 		struct rev_info rev;
 
-		head = lookup_commit_or_die(head_oid.hash, "HEAD");
+		head = lookup_commit_or_die(&head_oid, "HEAD");
 		init_revisions(&rev, NULL);
 		rev.commit_format = CMIT_FMT_ONELINE;
 		rev.ignore_merges = 1;

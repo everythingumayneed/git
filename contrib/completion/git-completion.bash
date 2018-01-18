@@ -111,8 +111,7 @@ __git ()
 #   GNU General Public License for more details.
 #
 #   You should have received a copy of the GNU General Public License
-#   along with this program; if not, write to the Free Software Foundation,
-#   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+#   along with this program; if not, see <http://www.gnu.org/licenses/>.
 #
 #   The latest version of this software can be obtained here:
 #
@@ -1205,7 +1204,7 @@ _git_branch ()
 			--color --no-color --verbose --abbrev= --no-abbrev
 			--track --no-track --contains --no-contains --merged --no-merged
 			--set-upstream-to= --edit-description --list
-			--unset-upstream --delete --move --remotes
+			--unset-upstream --delete --move --copy --remotes
 			--column --no-column --sort= --points-at
 			"
 		;;
@@ -1250,7 +1249,8 @@ _git_checkout ()
 	--*)
 		__gitcomp "
 			--quiet --ours --theirs --track --no-track --merge
-			--conflict= --orphan --patch
+			--conflict= --orphan --patch --detach --ignore-skip-worktree-bits
+			--recurse-submodules --no-recurse-submodules
 			"
 		;;
 	*)
@@ -1319,6 +1319,7 @@ _git_clone ()
 			--template=
 			--depth
 			--single-branch
+			--no-tags
 			--branch
 			--recurse-submodules
 			--no-single-branch
@@ -1384,7 +1385,7 @@ _git_describe ()
 		__gitcomp "
 			--all --tags --contains --abbrev= --candidates=
 			--exact-match --debug --long --match --always --first-parent
-			--exclude
+			--exclude --dirty --broken
 			"
 		return
 	esac
@@ -1399,7 +1400,7 @@ __git_diff_common_options="--stat --numstat --shortstat --summary
 			--patch-with-stat --name-only --name-status --color
 			--no-color --color-words --no-renames --check
 			--full-index --binary --abbrev --diff-filter=
-			--find-copies-harder
+			--find-copies-harder --ignore-cr-at-eol
 			--text --ignore-space-at-eol --ignore-space-change
 			--ignore-all-space --ignore-blank-lines --exit-code
 			--quiet --ext-diff --no-ext-diff
@@ -1921,6 +1922,7 @@ _git_pull ()
 	--*)
 		__gitcomp "
 			--rebase --no-rebase
+			--autostash --no-autostash
 			$__git_merge_options
 			$__git_fetch_options
 		"
@@ -2335,14 +2337,24 @@ _git_config ()
 	esac
 	__gitcomp "
 		add.ignoreErrors
+		advice.amWorkDir
 		advice.commitBeforeMerge
 		advice.detachedHead
 		advice.implicitIdentity
-		advice.pushNonFastForward
+		advice.pushAlreadyExists
+		advice.pushFetchFirst
+		advice.pushNeedsForce
+		advice.pushNonFFCurrent
+		advice.pushNonFFMatching
+		advice.pushUpdateRejected
 		advice.resolveConflict
+		advice.rmHints
 		advice.statusHints
+		advice.statusUoption
+		advice.ignoredHook
 		alias.
 		am.keepcr
+		am.threeWay
 		apply.ignorewhitespace
 		apply.whitespace
 		branch.autosetupmerge
@@ -2387,7 +2399,9 @@ _git_config ()
 		color.status.added
 		color.status.changed
 		color.status.header
+		color.status.localBranch
 		color.status.nobranch
+		color.status.remoteBranch
 		color.status.unmerged
 		color.status.untracked
 		color.status.updated
@@ -2403,6 +2417,8 @@ _git_config ()
 		core.autocrlf
 		core.bare
 		core.bigFileThreshold
+		core.checkStat
+		core.commentChar
 		core.compression
 		core.createObject
 		core.deltaBaseCacheLimit
@@ -2412,6 +2428,8 @@ _git_config ()
 		core.fileMode
 		core.fsyncobjectfiles
 		core.gitProxy
+		core.hideDotFiles
+		core.hooksPath
 		core.ignoreStat
 		core.ignorecase
 		core.logAllRefUpdates
@@ -2419,20 +2437,30 @@ _git_config ()
 		core.notesRef
 		core.packedGitLimit
 		core.packedGitWindowSize
+		core.packedRefsTimeout
 		core.pager
+		core.precomposeUnicode
 		core.preferSymlinkRefs
 		core.preloadindex
+		core.protectHFS
+		core.protectNTFS
 		core.quotepath
 		core.repositoryFormatVersion
 		core.safecrlf
 		core.sharedRepository
 		core.sparseCheckout
+		core.splitIndex
+		core.sshCommand
 		core.symlinks
 		core.trustctime
 		core.untrackedCache
 		core.warnAmbiguousRefs
 		core.whitespace
 		core.worktree
+		credential.helper
+		credential.useHttpPath
+		credential.username
+		credentialCache.ignoreSIGHUP
 		diff.autorefreshindex
 		diff.external
 		diff.ignoreSubmodules
@@ -2464,15 +2492,19 @@ _git_config ()
 		format.thread
 		format.to
 		gc.
+		gc.aggressiveDepth
 		gc.aggressiveWindow
 		gc.auto
+		gc.autoDetach
 		gc.autopacklimit
+		gc.logExpiry
 		gc.packrefs
 		gc.pruneexpire
 		gc.reflogexpire
 		gc.reflogexpireunreachable
 		gc.rerereresolved
 		gc.rerereunresolved
+		gc.worktreePruneExpire
 		gitcvs.allbinary
 		gitcvs.commitmsgannotation
 		gitcvs.dbTableNamePrefix
@@ -2610,7 +2642,10 @@ _git_config ()
 		sendemail.suppressfrom
 		sendemail.thread
 		sendemail.to
+		sendemail.tocmd
 		sendemail.validate
+		sendemail.smtpbatchsize
+		sendemail.smtprelogindelay
 		showbranch.default
 		status.relativePaths
 		status.showUntrackedFiles

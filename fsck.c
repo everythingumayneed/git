@@ -358,15 +358,15 @@ static int fsck_walk_tree(struct tree *tree, void *data, struct fsck_options *op
 			continue;
 
 		if (S_ISDIR(entry.mode)) {
-			obj = &lookup_tree(entry.oid->hash)->object;
-			if (name)
+			obj = (struct object *)lookup_tree(entry.oid);
+			if (name && obj)
 				put_object_name(options, obj, "%s%s/", name,
 					entry.path);
 			result = options->walk(obj, OBJ_TREE, data, options);
 		}
 		else if (S_ISREG(entry.mode) || S_ISLNK(entry.mode)) {
-			obj = &lookup_blob(entry.oid->hash)->object;
-			if (name)
+			obj = (struct object *)lookup_blob(entry.oid);
+			if (name && obj)
 				put_object_name(options, obj, "%s%s", name,
 					entry.path);
 			result = options->walk(obj, OBJ_BLOB, data, options);
@@ -461,7 +461,7 @@ int fsck_walk(struct object *obj, void *data, struct fsck_options *options)
 		return -1;
 
 	if (obj->type == OBJ_NONE)
-		parse_object(obj->oid.hash);
+		parse_object(&obj->oid);
 
 	switch (obj->type) {
 	case OBJ_BLOB:
@@ -588,6 +588,7 @@ static int fsck_tree(struct tree *item, struct fsck_options *options)
 		case S_IFREG | 0664:
 			if (!options->strict)
 				break;
+			/* fallthrough */
 		default:
 			has_bad_modes = 1;
 		}
@@ -691,7 +692,7 @@ static int fsck_ident(const char **ident, struct object *obj, struct fsck_option
 	p++;
 	if (*p == '0' && p[1] != ' ')
 		return report(options, obj, FSCK_MSG_ZERO_PADDED_DATE, "invalid author/committer line - zero-padded date");
-	if (date_overflows(strtoul(p, &end, 10)))
+	if (date_overflows(parse_timestamp(p, &end, 10)))
 		return report(options, obj, FSCK_MSG_BAD_DATE_OVERFLOW, "invalid author/committer line - date causes integer overflow");
 	if ((end == p || *end != ' '))
 		return report(options, obj, FSCK_MSG_BAD_DATE, "invalid author/committer line - bad date");
@@ -736,7 +737,7 @@ static int fsck_commit_buffer(struct commit *commit, const char *buffer,
 		buffer += 41;
 		parent_line_count++;
 	}
-	graft = lookup_commit_graft(commit->object.oid.hash);
+	graft = lookup_commit_graft(&commit->object.oid);
 	parent_count = commit_list_count(commit->parents);
 	if (graft) {
 		if (graft->nr_parent == -1 && !parent_count)

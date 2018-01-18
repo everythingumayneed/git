@@ -1,5 +1,6 @@
 #include "builtin.h"
 #include "cache.h"
+#include "config.h"
 #include "color.h"
 #include "parse-options.h"
 #include "urlmatch.h"
@@ -51,6 +52,7 @@ static int show_origin;
 #define TYPE_INT (1<<1)
 #define TYPE_BOOL_OR_INT (1<<2)
 #define TYPE_PATH (1<<3)
+#define TYPE_EXPIRY_DATE (1<<4)
 
 static struct option builtin_config_options[] = {
 	OPT_GROUP(N_("Config file location")),
@@ -79,6 +81,7 @@ static struct option builtin_config_options[] = {
 	OPT_BIT(0, "int", &types, N_("value is decimal number"), TYPE_INT),
 	OPT_BIT(0, "bool-or-int", &types, N_("value is --bool or --int"), TYPE_BOOL_OR_INT),
 	OPT_BIT(0, "path", &types, N_("value is a path (file or directory name)"), TYPE_PATH),
+	OPT_BIT(0, "expiry-date", &types, N_("value is an expiry date"), TYPE_EXPIRY_DATE),
 	OPT_GROUP(N_("Other")),
 	OPT_BOOL('z', "null", &end_null, N_("terminate values with NUL byte")),
 	OPT_BOOL(0, "name-only", &omit_values, N_("show variable names only")),
@@ -158,6 +161,11 @@ static int format_config(struct strbuf *buf, const char *key_, const char *value
 				return -1;
 			strbuf_addstr(buf, v);
 			free((char *)v);
+		} else if (types == TYPE_EXPIRY_DATE) {
+			timestamp_t t;
+			if (git_config_expiry_date(&t, key_, value_) < 0)
+				return -1;
+			strbuf_addf(buf, "%"PRItime, t);
 		} else if (value_) {
 			strbuf_addstr(buf, value_);
 		} else {
@@ -214,8 +222,7 @@ static int get_value(const char *key_, const char *regex_)
 		key_regexp = (regex_t*)xmalloc(sizeof(regex_t));
 		if (regcomp(key_regexp, key, REG_EXTENDED)) {
 			error("invalid key pattern: %s", key_);
-			free(key_regexp);
-			key_regexp = NULL;
+			FREE_AND_NULL(key_regexp);
 			ret = CONFIG_INVALID_PATTERN;
 			goto free_strings;
 		}
@@ -235,15 +242,14 @@ static int get_value(const char *key_, const char *regex_)
 		regexp = (regex_t*)xmalloc(sizeof(regex_t));
 		if (regcomp(regexp, regex_, REG_EXTENDED)) {
 			error("invalid pattern: %s", regex_);
-			free(regexp);
-			regexp = NULL;
+			FREE_AND_NULL(regexp);
 			ret = CONFIG_INVALID_PATTERN;
 			goto free_strings;
 		}
 	}
 
-	git_config_with_options(collect_config, &values,
-				&given_config_source, &config_options);
+	config_with_options(collect_config, &values,
+			    &given_config_source, &config_options);
 
 	ret = !values.nr;
 
@@ -274,12 +280,13 @@ static char *normalize_value(const char *key, const char *value)
 	if (!value)
 		return NULL;
 
-	if (types == 0 || types == TYPE_PATH)
+	if (types == 0 || types == TYPE_PATH || types == TYPE_EXPIRY_DATE)
 		/*
 		 * We don't do normalization for TYPE_PATH here: If
 		 * the path is like ~/foobar/, we prefer to store
 		 * "~/foobar/" in the config file, and to expand the ~
 		 * when retrieving the value.
+		 * Also don't do normalization for expiry dates.
 		 */
 		return xstrdup(value);
 	if (types == TYPE_INT)
@@ -320,8 +327,8 @@ static void get_color(const char *var, const char *def_color)
 	get_color_slot = var;
 	get_color_found = 0;
 	parsed_color[0] = '\0';
-	git_config_with_options(git_get_color_config, NULL,
-				&given_config_source, &config_options);
+	config_with_options(git_get_color_config, NULL,
+			    &given_config_source, &config_options);
 
 	if (!get_color_found && def_color) {
 		if (color_parse(def_color, parsed_color) < 0)
@@ -352,8 +359,8 @@ static int get_colorbool(const char *var, int print)
 	get_colorbool_found = -1;
 	get_diff_color_found = -1;
 	get_color_ui_found = -1;
-	git_config_with_options(git_get_colorbool_config, NULL,
-				&given_config_source, &config_options);
+	config_with_options(git_get_colorbool_config, NULL,
+			    &given_config_source, &config_options);
 
 	if (get_colorbool_found < 0) {
 		if (!strcmp(get_colorbool_slot, "color.diff"))
@@ -441,8 +448,8 @@ static int get_urlmatch(const char *var, const char *url)
 		show_keys = 1;
 	}
 
-	git_config_with_options(urlmatch_config_entry, &config,
-				&given_config_source, &config_options);
+	config_with_options(urlmatch_config_entry, &config,
+			    &given_config_source, &config_options);
 
 	ret = !values.nr;
 
@@ -519,10 +526,13 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 			die("$HOME not set");
 
 		if (access_or_warn(user_config, R_OK, 0) &&
-		    xdg_config && !access_or_warn(xdg_config, R_OK, 0))
+		    xdg_config && !access_or_warn(xdg_config, R_OK, 0)) {
 			given_config_source.file = xdg_config;
-		else
+			free(user_config);
+		} else {
 			given_config_source.file = user_config;
+			free(xdg_config);
+		}
 	}
 	else if (use_system_config)
 		given_config_source.file = git_etc_gitconfig();
@@ -538,6 +548,10 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 		config_options.respect_includes = !given_config_source.file;
 	else
 		config_options.respect_includes = respect_includes_opt;
+	if (!nongit) {
+		config_options.commondir = get_git_common_dir();
+		config_options.git_dir = get_git_dir();
+	}
 
 	if (end_null) {
 		term = '\0';
@@ -582,9 +596,9 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 
 	if (actions == ACTION_LIST) {
 		check_argc(argc, 0, 0);
-		if (git_config_with_options(show_all_config, NULL,
-					    &given_config_source,
-					    &config_options) < 0) {
+		if (config_with_options(show_all_config, NULL,
+					&given_config_source,
+					&config_options) < 0) {
 			if (given_config_source.file)
 				die_errno("unable to read config file '%s'",
 					  given_config_source.file);
@@ -625,6 +639,7 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 		check_write();
 		check_argc(argc, 2, 2);
 		value = normalize_value(argv[0], argv[1]);
+		UNLEAK(value);
 		ret = git_config_set_in_file_gently(given_config_source.file, argv[0], value);
 		if (ret == CONFIG_NOTHING_SET)
 			error(_("cannot overwrite multiple values with a single value\n"
@@ -635,6 +650,7 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 		check_write();
 		check_argc(argc, 2, 3);
 		value = normalize_value(argv[0], argv[1]);
+		UNLEAK(value);
 		return git_config_set_multivar_in_file_gently(given_config_source.file,
 							      argv[0], value, argv[2], 0);
 	}
@@ -642,6 +658,7 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 		check_write();
 		check_argc(argc, 2, 2);
 		value = normalize_value(argv[0], argv[1]);
+		UNLEAK(value);
 		return git_config_set_multivar_in_file_gently(given_config_source.file,
 							      argv[0], value,
 							      CONFIG_REGEX_NONE, 0);
@@ -650,6 +667,7 @@ int cmd_config(int argc, const char **argv, const char *prefix)
 		check_write();
 		check_argc(argc, 2, 3);
 		value = normalize_value(argv[0], argv[1]);
+		UNLEAK(value);
 		return git_config_set_multivar_in_file_gently(given_config_source.file,
 							      argv[0], value, argv[2], 1);
 	}

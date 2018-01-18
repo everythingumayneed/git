@@ -1,4 +1,6 @@
 #include "cache.h"
+#include "checkout.h"
+#include "config.h"
 #include "builtin.h"
 #include "dir.h"
 #include "parse-options.h"
@@ -31,13 +33,26 @@ struct add_opts {
 
 static int show_only;
 static int verbose;
-static unsigned long expire;
+static int guess_remote;
+static timestamp_t expire;
+
+static int git_worktree_config(const char *var, const char *value, void *cb)
+{
+	if (!strcmp(var, "worktree.guessremote")) {
+		guess_remote = git_config_bool(var, value);
+		return 0;
+	}
+
+	return git_default_config(var, value, cb);
+}
 
 static int prune_worktree(const char *id, struct strbuf *reason)
 {
 	struct stat st;
 	char *path;
-	int fd, len;
+	int fd;
+	size_t len;
+	ssize_t read_result;
 
 	if (!is_directory(git_path("worktrees/%s", id))) {
 		strbuf_addf(reason, _("Removing worktrees/%s: not a valid directory"), id);
@@ -55,10 +70,26 @@ static int prune_worktree(const char *id, struct strbuf *reason)
 			    id, strerror(errno));
 		return 1;
 	}
-	len = st.st_size;
+	len = xsize_t(st.st_size);
 	path = xmallocz(len);
-	read_in_full(fd, path, len);
+
+	read_result = read_in_full(fd, path, len);
+	if (read_result < 0) {
+		strbuf_addf(reason, _("Removing worktrees/%s: unable to read gitdir file (%s)"),
+			    id, strerror(errno));
+		close(fd);
+		free(path);
+		return 1;
+	}
 	close(fd);
+
+	if (read_result != len) {
+		strbuf_addf(reason,
+			    _("Removing worktrees/%s: short read (expected %"PRIuMAX" bytes, read %"PRIuMAX")"),
+			    id, (uintmax_t)len, (uintmax_t)read_result);
+		free(path);
+		return 1;
+	}
 	while (len && (path[len - 1] == '\n' || path[len - 1] == '\r'))
 		len--;
 	if (!len) {
@@ -131,7 +162,7 @@ static int prune(int ac, const char **av, const char *prefix)
 		OPT_END()
 	};
 
-	expire = ULONG_MAX;
+	expire = TIME_MAX;
 	ac = parse_options(ac, av, prefix, options, worktree_usage, 0);
 	if (ac)
 		usage_with_options(worktree_usage, options);
@@ -199,20 +230,21 @@ static int add_worktree(const char *path, const char *refname,
 	int counter = 0, len, ret;
 	struct strbuf symref = STRBUF_INIT;
 	struct commit *commit = NULL;
+	int is_branch = 0;
 
 	if (file_exists(path) && !is_empty_dir(path))
 		die(_("'%s' already exists"), path);
 
 	/* is 'refname' a branch or commit? */
 	if (!opts->detach && !strbuf_check_branch_ref(&symref, refname) &&
-		 ref_exists(symref.buf)) { /* it's a branch */
+	    ref_exists(symref.buf)) {
+		is_branch = 1;
 		if (!opts->force)
 			die_if_checked_out(symref.buf, 0);
-	} else { /* must be a commit */
-		commit = lookup_commit_reference_by_name(refname);
-		if (!commit)
-			die(_("invalid reference: %s"), refname);
 	}
+	commit = lookup_commit_reference_by_name(refname);
+	if (!commit)
+		die(_("invalid reference: %s"), refname);
 
 	name = worktree_basename(path, &len);
 	git_path_buf(&sb_repo, "worktrees/%.*s", (int)(path + len - name), name);
@@ -277,7 +309,7 @@ static int add_worktree(const char *path, const char *refname,
 	argv_array_pushf(&child_env, "%s=%s", GIT_WORK_TREE_ENVIRONMENT, path);
 	cp.git_cmd = 1;
 
-	if (commit)
+	if (!is_branch)
 		argv_array_pushl(&cp.args, "update-ref", "HEAD",
 				 oid_to_hex(&commit->object.oid), NULL);
 	else
@@ -299,10 +331,8 @@ static int add_worktree(const char *path, const char *refname,
 	}
 
 	is_junk = 0;
-	free(junk_work_tree);
-	free(junk_git_dir);
-	junk_work_tree = NULL;
-	junk_git_dir = NULL;
+	FREE_AND_NULL(junk_work_tree);
+	FREE_AND_NULL(junk_git_dir);
 
 done:
 	if (ret || !opts->keep_locked) {
@@ -310,6 +340,15 @@ done:
 		strbuf_addf(&sb, "%s/locked", sb_repo.buf);
 		unlink_or_warn(sb.buf);
 	}
+
+	/*
+	 * Hook failure does not warrant worktree deletion, so run hook after
+	 * is_junk is cleared, but do return appropriate code when hook fails.
+	 */
+	if (!ret && opts->checkout)
+		ret = run_hook_le(NULL, "post-checkout", oid_to_hex(&null_oid),
+				  oid_to_hex(&commit->object.oid), "1", NULL);
+
 	argv_array_clear(&child_env);
 	strbuf_release(&sb);
 	strbuf_release(&symref);
@@ -324,6 +363,7 @@ static int add(int ac, const char **av, const char *prefix)
 	const char *new_branch_force = NULL;
 	char *path;
 	const char *branch;
+	const char *opt_track = NULL;
 	struct option options[] = {
 		OPT__FORCE(&opts.force, N_("checkout <branch> even if already checked out in other worktree")),
 		OPT_STRING('b', NULL, &opts.new_branch, N_("branch"),
@@ -333,6 +373,11 @@ static int add(int ac, const char **av, const char *prefix)
 		OPT_BOOL(0, "detach", &opts.detach, N_("detach HEAD at named commit")),
 		OPT_BOOL(0, "checkout", &opts.checkout, N_("populate the new working tree")),
 		OPT_BOOL(0, "lock", &opts.keep_locked, N_("keep the new working tree locked")),
+		OPT_PASSTHRU(0, "track", &opt_track, NULL,
+			     N_("set up tracking mode (see git-branch(1))"),
+			     PARSE_OPT_NOARG | PARSE_OPT_OPTARG),
+		OPT_BOOL(0, "guess-remote", &guess_remote,
+			 N_("try to match the new branch name with a remote-tracking branch")),
 		OPT_END()
 	};
 
@@ -367,6 +412,28 @@ static int add(int ac, const char **av, const char *prefix)
 		int n;
 		const char *s = worktree_basename(path, &n);
 		opts.new_branch = xstrndup(s, n);
+		if (guess_remote) {
+			struct object_id oid;
+			const char *remote =
+				unique_tracking_name(opts.new_branch, &oid);
+			if (remote)
+				branch = remote;
+		}
+	}
+
+	if (ac == 2 && !opts.new_branch && !opts.detach) {
+		struct object_id oid;
+		struct commit *commit;
+		const char *remote;
+
+		commit = lookup_commit_reference_by_name(branch);
+		if (!commit) {
+			remote = unique_tracking_name(branch, &oid);
+			if (remote) {
+				opts.new_branch = branch;
+				branch = remote;
+			}
+		}
 	}
 
 	if (opts.new_branch) {
@@ -377,11 +444,17 @@ static int add(int ac, const char **av, const char *prefix)
 			argv_array_push(&cp.args, "--force");
 		argv_array_push(&cp.args, opts.new_branch);
 		argv_array_push(&cp.args, branch);
+		if (opt_track)
+			argv_array_push(&cp.args, opt_track);
 		if (run_command(&cp))
 			return -1;
 		branch = opts.new_branch;
+	} else if (opt_track) {
+		die(_("--[no-]track can only be used if a new branch is created"));
 	}
 
+	UNLEAK(path);
+	UNLEAK(opts);
 	return add_worktree(path, branch, &opts);
 }
 
@@ -391,7 +464,7 @@ static void show_worktree_porcelain(struct worktree *wt)
 	if (wt->is_bare)
 		printf("bare\n");
 	else {
-		printf("HEAD %s\n", sha1_to_hex(wt->head_sha1));
+		printf("HEAD %s\n", oid_to_hex(&wt->head_oid));
 		if (wt->is_detached)
 			printf("detached\n");
 		else if (wt->head_ref)
@@ -411,7 +484,7 @@ static void show_worktree(struct worktree *wt, int path_maxlen, int abbrev_len)
 		strbuf_addstr(&sb, "(bare)");
 	else {
 		strbuf_addf(&sb, "%-*s ", abbrev_len,
-				find_unique_abbrev(wt->head_sha1, DEFAULT_ABBREV));
+				find_unique_abbrev(wt->head_oid.hash, DEFAULT_ABBREV));
 		if (wt->is_detached)
 			strbuf_addstr(&sb, "(detached HEAD)");
 		else if (wt->head_ref) {
@@ -436,7 +509,7 @@ static void measure_widths(struct worktree **wt, int *abbrev, int *maxlen)
 
 		if (path_len > *maxlen)
 			*maxlen = path_len;
-		sha1_len = strlen(find_unique_abbrev(wt[i]->head_sha1, *abbrev));
+		sha1_len = strlen(find_unique_abbrev(wt[i]->head_oid.hash, *abbrev));
 		if (sha1_len > *abbrev)
 			*abbrev = sha1_len;
 	}
@@ -538,7 +611,7 @@ int cmd_worktree(int ac, const char **av, const char *prefix)
 		OPT_END()
 	};
 
-	git_config(git_default_config, NULL);
+	git_config(git_worktree_config, NULL);
 
 	if (ac < 2)
 		usage_with_options(worktree_usage, options);

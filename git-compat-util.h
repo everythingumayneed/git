@@ -189,6 +189,9 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(__CYGWIN__)
+#include "compat/cygwin.h"
+#endif
 #if defined(__MINGW32__)
 /* pull in Windows compatibility stuff */
 #include "compat/mingw.h"
@@ -318,6 +321,11 @@ extern char *gitdirname(char *);
 #ifndef PRIo32
 #define PRIo32 "o"
 #endif
+
+typedef uintmax_t timestamp_t;
+#define PRItime PRIuMAX
+#define parse_timestamp strtoumax
+#define TIME_MAX UINTMAX_MAX
 
 #ifndef PATH_SEP
 #define PATH_SEP ':'
@@ -477,6 +485,29 @@ static inline int skip_prefix(const char *str, const char *prefix,
 }
 
 /*
+ * If the string "str" is the same as the string in "prefix", then the "arg"
+ * parameter is set to the "def" parameter and 1 is returned.
+ * If the string "str" begins with the string found in "prefix" and then a
+ * "=" sign, then the "arg" parameter is set to "str + strlen(prefix) + 1"
+ * (i.e., to the point in the string right after the prefix and the "=" sign),
+ * and 1 is returned.
+ *
+ * Otherwise, return 0 and leave "arg" untouched.
+ *
+ * When we accept both a "--key" and a "--key=<val>" option, this function
+ * can be used instead of !strcmp(arg, "--key") and then
+ * skip_prefix(arg, "--key=", &arg) to parse such an option.
+ */
+int skip_to_optional_arg_default(const char *str, const char *prefix,
+				 const char **arg, const char *def);
+
+static inline int skip_to_optional_arg(const char *str, const char *prefix,
+				       const char **arg)
+{
+	return skip_to_optional_arg_default(str, prefix, arg, "");
+}
+
+/*
  * Like skip_prefix, but promises never to read past "len" bytes of the input
  * buffer, and returns the remaining number of bytes in "out" via "outlen".
  */
@@ -615,7 +646,7 @@ extern int git_lstat(const char *, struct stat *);
 #endif
 
 #define DEFAULT_PACKED_GIT_LIMIT \
-	((1024L * 1024L) * (size_t)(sizeof(void*) >= 8 ? 8192 : 256))
+	((1024L * 1024L) * (size_t)(sizeof(void*) >= 8 ? (32 * 1024L * 1024L) : 256))
 
 #ifdef NO_PREAD
 #define pread git_pread
@@ -688,10 +719,12 @@ char *gitstrdup(const char *s);
 #endif
 
 #ifdef FREAD_READS_DIRECTORIES
-#ifdef fopen
-#undef fopen
-#endif
-#define fopen(a,b) git_fopen(a,b)
+# if !defined(SUPPRESS_FOPEN_REDEFINITION)
+#  ifdef fopen
+#   undef fopen
+#  endif
+#  define fopen(a,b) git_fopen(a,b)
+# endif
 extern FILE *git_fopen(const char*, const char*);
 #endif
 
@@ -738,8 +771,6 @@ const char *inet_ntop(int af, const void *src, char *dst, size_t size);
 #define atexit git_atexit
 extern int git_atexit(void (*handler)(void));
 #endif
-
-extern void release_pack_memory(size_t);
 
 typedef void (*try_to_free_t)(size_t);
 extern try_to_free_t set_try_to_free_routine(try_to_free_t);
@@ -799,6 +830,13 @@ extern int xmkstemp(char *template);
 extern int xmkstemp_mode(char *template, int mode);
 extern char *xgetcwd(void);
 extern FILE *fopen_for_writing(const char *path);
+extern FILE *fopen_or_warn(const char *path, const char *mode);
+
+/*
+ * FREE_AND_NULL(ptr) is like free(ptr) followed by ptr = NULL. Note
+ * that ptr is used twice, so don't pass e.g. ptr++.
+ */
+#define FREE_AND_NULL(p) do { free(p); (p) = NULL; } while (0)
 
 #define ALLOC_ARRAY(x, alloc) (x) = xmalloc(st_mult(sizeof(*(x)), (alloc)))
 #define REALLOC_ARRAY(x, alloc) (x) = xrealloc((x), st_mult(sizeof(*(x)), (alloc)))
@@ -809,6 +847,14 @@ static inline void copy_array(void *dst, const void *src, size_t n, size_t size)
 {
 	if (n)
 		memcpy(dst, src, st_mult(size, n));
+}
+
+#define MOVE_ARRAY(dst, src, n) move_array((dst), (src), (n), sizeof(*(dst)) + \
+	BUILD_ASSERT_OR_ZERO(sizeof(*(dst)) == sizeof(*(src))))
+static inline void move_array(void *dst, const void *src, size_t n, size_t size)
+{
+	if (n)
+		memmove(dst, src, st_mult(size, n));
 }
 
 /*
@@ -875,9 +921,11 @@ static inline char *xstrdup_or_null(const char *str)
 
 static inline size_t xsize_t(off_t len)
 {
-	if (len > (size_t) len)
+	size_t size = (size_t) len;
+
+	if (len != (off_t) size)
 		die("Cannot handle files this big");
-	return (size_t)len;
+	return size;
 }
 
 __attribute__((format (printf, 3, 4)))
@@ -1105,8 +1153,8 @@ int remove_or_warn(unsigned int mode, const char *path);
 int access_or_warn(const char *path, int mode, unsigned flag);
 int access_or_die(const char *path, int mode, unsigned flag);
 
-/* Warn on an inaccessible file that ought to be accessible */
-void warn_on_inaccessible(const char *path);
+/* Warn on an inaccessible file if errno indicates this is an error */
+int warn_on_fopen_errors(const char *path);
 
 #ifdef GMTIME_UNRELIABLE_ERRORS
 struct tm *git_gmtime(const time_t *);
@@ -1129,6 +1177,41 @@ struct tm *git_gmtime_r(const time_t *, struct tm *);
 #define getc_unlocked(fh) getc(fh)
 #endif
 
+/*
+ * Our code often opens a path to an optional file, to work on its
+ * contents when we can successfully open it.  We can ignore a failure
+ * to open if such an optional file does not exist, but we do want to
+ * report a failure in opening for other reasons (e.g. we got an I/O
+ * error, or the file is there, but we lack the permission to open).
+ *
+ * Call this function after seeing an error from open() or fopen() to
+ * see if the errno indicates a missing file that we can safely ignore.
+ */
+static inline int is_missing_file_error(int errno_)
+{
+	return (errno_ == ENOENT || errno_ == ENOTDIR);
+}
+
 extern int cmd_main(int, const char **);
+
+/*
+ * You can mark a stack variable with UNLEAK(var) to avoid it being
+ * reported as a leak by tools like LSAN or valgrind. The argument
+ * should generally be the variable itself (not its address and not what
+ * it points to). It's safe to use this on pointers which may already
+ * have been freed, or on pointers which may still be in use.
+ *
+ * Use this _only_ for a variable that leaks by going out of scope at
+ * program exit (so only from cmd_* functions or their direct helpers).
+ * Normal functions, especially those which may be called multiple
+ * times, should actually free their memory. This is only meant as
+ * an annotation, and does nothing in non-leak-checking builds.
+ */
+#ifdef SUPPRESS_ANNOTATED_LEAKS
+extern void unleak_memory(const void *ptr, size_t len);
+#define UNLEAK(var) unleak_memory(&(var), sizeof(var))
+#else
+#define UNLEAK(var) do {} while (0)
+#endif
 
 #endif
